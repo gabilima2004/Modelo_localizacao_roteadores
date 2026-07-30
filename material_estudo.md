@@ -40,6 +40,7 @@ flowchart LR
 ```
 
 **No projeto:**
+
 - Você **não sabe** de antemão quais roteadores são residenciais ou comerciais (não tem rótulos)
 - Você tem as **features** de cada roteador (tráfego por hora, estatísticas, etc.)
 - O algoritmo agrupa roteadores com **perfis parecidos**
@@ -88,10 +89,11 @@ flowchart TD
 **O que é:** Entender **exatamente** o que você quer resolver, em linguagem de negócio.
 
 **Perguntas que você deve se fazer:**
-- Qual pergunta estou respondendo? → *"Este roteador é residencial ou comercial?"*
-- Como vou usar o resultado? → *"Para segmentar clientes, planejar capacidade da rede, etc."*
-- Que dados preciso? → *"Tráfego de rede ao longo do tempo"*
-- Como vou saber se funcionou? → *"Validar com a localização do roteador"*
+
+- Qual pergunta estou respondendo? → _"Este roteador é residencial ou comercial?"_
+- Como vou usar o resultado? → _"Para segmentar clientes, planejar capacidade da rede, etc."_
+- Que dados preciso? → _"Tráfego de rede ao longo do tempo"_
+- Como vou saber se funcionou? → _"Validar com a localização do roteador"_
 
 > **Erro comum de iniciante:** pular esta etapa e ir direto pro código. Sem clareza do problema, você analisa a coisa errada.
 
@@ -102,6 +104,7 @@ flowchart TD
 **No projeto:** dados no QuestDB nas tabelas `routers` e `device_metrics`.
 
 **Conceitos importantes:**
+
 - **Schema:** a estrutura das tabelas (quais colunas, quais tipos). Você precisa saber quais colunas existem antes de consultar.
 - **Amostragem:** se há milhões de linhas, pode ser inviável carregar tudo. Você pode filtrar por data ou amostrar aleatoriamente.
 - **Cache:** salvar os dados extraídos em arquivo local (CSV, Parquet) para não re-consultar o banco a cada iteração. Durante o desenvolvimento você vai rodar o código dezenas de vezes — consultar o banco toda vez é lento.
@@ -130,6 +133,7 @@ flowchart TD
 **Por que é necessário:** os dados brutos (timestamp + bytes acumulados) não são diretamente úteis. Precisamos transformá-los.
 
 **Exemplos no projeto:**
+
 - Dado bruto: `bytes_up = 1500000` (acumulado) → Feature: `delta_bytes_up = 50000` (tráfego na última hora)
 - Dado bruto: `timestamp = 2025-01-15 14:30` → Feature: `hora = 14`, `eh_comercial = True`
 - Dados brutos de um dia inteiro → Feature: `media_comercial = 480000` (média do tráfego das 8h-18h)
@@ -142,10 +146,12 @@ flowchart TD
 **O que é:** Aplicar o algoritmo que resolve o problema.
 
 **No projeto:** duas abordagens:
+
 - **Regra de negócio:** `se razao_comercial > 0.5 → comercial`
 - **Clustering (K-Means):** agrupa roteadores por similaridade do perfil horário
 
 **Decisões que você toma aqui:**
+
 - Qual algoritmo?
 - Quais features usar?
 - Quais parâmetros? (ex: K=2 ou K=3 no K-Means)
@@ -155,6 +161,7 @@ flowchart TD
 **O que é:** Verificar se o resultado faz sentido.
 
 **Como avaliar clustering (sem rótulos):**
+
 - **Inspeção visual:** plotar os perfis horários de cada grupo — faz sentido?
 - **Métricas internas:** Silhouette Score (mede quão bem separados os grupos estão)
 - **Validação externa:** cruzar com a localização (tabela `routers`) — roteadores "comerciais" estão em zonas comerciais?
@@ -200,10 +207,12 @@ $$\bar{x} = \frac{1}{n}\sum_{i=1}^{n} x_i$$
 **O que é:** o valor do "meio" quando os dados estão ordenados. Metade dos valores está acima, metade abaixo.
 
 **Como calcular:**
+
 1. Ordena os dados: `[10, 20, 30, 40, 100]`
 2. Pega o do meio (posição 3 de 5): **30**
 
 **Se houver número par de valores** (ex: `[10, 20, 30, 40]`):
+
 - Pega os dois do meio: 20 e 30
 - Mediana = média deles = (20+30)/2 = **25**
 
@@ -244,6 +253,7 @@ $$\min = 10, \quad \max = 100$$
 - **Q3 (terceiro quartil):** 75% dos dados estão abaixo dele
 
 **Como calcular** (para `[10, 20, 30, 40, 100]`):
+
 - Q1 = valor na posição 25% → entre 10 e 20 → **15** (interpolação)
 - Q2 = mediana = **30**
 - Q3 = valor na posição 75% → entre 40 e 100 → **70**
@@ -259,6 +269,7 @@ $$\min = 10, \quad \max = 100$$
 **O que é:** mede quão "espalhados" os dados estão em relação à média.
 
 **Como calcular:**
+
 1. Calcula a média: 40
 2. Para cada valor, calcula a diferença da média e eleva ao quadrado:
    - $(10-40)^2 = 900$
@@ -288,6 +299,7 @@ $$s = \sqrt{1250} \approx 35.4$$
 **Por que não usar só a variância?** A variância está em "unidades ao quadrado" (ex: MB²), o que não faz sentido prático. O desvio padrão volta para a unidade original (MB).
 
 **Interpretação prática:**
+
 - Desvio **baixo** → dados concentrados perto da média → tráfego **consistente** (típico de comercial)
 - Desvio **alto** → dados espalhados → tráfego **variável** (típico de residencial com pico noturno e vale de madrugada)
 
@@ -321,14 +333,14 @@ $$\text{amplitude} = 100 - 10 = 90$$
 
 ## 3.10 Resumo: qual usar quando?
 
-| Estatística | Resiste a outliers? | Mede o quê? |
-|---|---|---|
-| **Média** | ❌ Não | Tendência central |
-| **Mediana** | ✅ Sim | Tendência central (robusta) |
-| **Desvio padrão** | ❌ Não | Dispersão |
-| **IQR (Q3-Q1)** | ✅ Sim | Dispersão (robusta) |
-| **Coef. variação** | ❌ Não | Dispersão relativa (comparar escalas) |
-| **Amplitude** | ❌ Não | Dispersão (simples mas frágil) |
+| Estatística        | Resiste a outliers? | Mede o quê?                           |
+| ------------------ | ------------------- | ------------------------------------- |
+| **Média**          | ❌ Não              | Tendência central                     |
+| **Mediana**        | ✅ Sim              | Tendência central (robusta)           |
+| **Desvio padrão**  | ❌ Não              | Dispersão                             |
+| **IQR (Q3-Q1)**    | ✅ Sim              | Dispersão (robusta)                   |
+| **Coef. variação** | ❌ Não              | Dispersão relativa (comparar escalas) |
+| **Amplitude**      | ❌ Não              | Dispersão (simples mas frágil)        |
 
 ---
 
@@ -386,11 +398,11 @@ O algoritmo **encontra sozinho** a regra que melhor separa os dois grupos. Talve
 
 **A diferença fundamental:**
 
-| | Programação tradicional | Machine Learning |
-|---|---|---|
-| **Quem escreve a regra?** | Você, humano | O algoritmo descobre |
-| **O que você dá?** | As regras + os dados | Os dados + as respostas |
-| **Exemplo** | `if tráfego > X: comercial` | "Aqui estão 50 exemplos rotulados, descubra o padrão" |
+|                           | Programação tradicional     | Machine Learning                                      |
+| ------------------------- | --------------------------- | ----------------------------------------------------- |
+| **Quem escreve a regra?** | Você, humano                | O algoritmo descobre                                  |
+| **O que você dá?**        | As regras + os dados        | Os dados + as respostas                               |
+| **Exemplo**               | `if tráfego > X: comercial` | "Aqui estão 50 exemplos rotulados, descubra o padrão" |
 
 ```mermaid
 flowchart LR
@@ -413,6 +425,7 @@ flowchart LR
 > "Um programa de computador aprende com experiência E em relação a uma tarefa T e medida de desempenho P, se seu desempenho em T, medido por P, melhora com a experiência E."
 
 **Traduzindo para o projeto:**
+
 - **T (tarefa):** classificar roteador como comercial ou residencial
 - **E (experiência):** os dados históricos de tráfego de milhares de roteadores
 - **P (desempenho):** % de classificações corretas
@@ -430,6 +443,7 @@ Você tem **rótulos** (respostas) em parte dos dados.
 > No projeto: você rotula manualmente 50 roteadores (olhando o endereço no Google Maps). Treina um modelo. Ele classifica os outros 950 automaticamente.
 
 **Subtipos:**
+
 - **Classificação:** rótulos categóricos → "comercial" vs "residencial"
 - **Regressão:** rótulos numéricos → prever **quantos** bytes de tráfego um roteador terá amanhã
 
@@ -440,6 +454,7 @@ Você **não tem rótulos**. O algoritmo encontra estrutura.
 > No projeto: você não sabe qual roteador é o quê. O K-Means agrupa por similaridade do perfil horário. Depois você interpreta os grupos.
 
 **Técnicas:**
+
 - **Clustering:** agrupar parecidos (K-Means)
 - **Redução de dimensionalidade:** simplificar muitas features em poucas (PCA)
 - **Detecção de anomalias:** encontrar outliers (roteadores com comportamento estranho)
@@ -457,17 +472,21 @@ O agente age e recebe **recompensas/punições**.
 O projeto tem **duas partes**:
 
 ### Parte 1: Regra de negócio (NÃO é ML)
+
 ```python
 if razao_comercial > 0.5:
     classe = "comercial"
 ```
+
 Isso é programação tradicional. Você definiu a regra.
 
 ### Parte 2: Clustering (É ML — não supervisionado)
+
 ```python
 kmeans = KMeans(n_clusters=2)
 kmeans.fit(perfil_horario)  # o algoritmo descobre os grupos
 ```
+
 Aqui você **não** disse qual roteador é o quê. Você deu os perfis e o algoritmo **encontrou** os grupos. Isso é ML.
 
 > **A beleza de usar ambos:** a regra serve de "baseline" (referência). Se o clustering concordar com a regra, você ganha confiança. Se discordar, você investiga os casos especiais.
@@ -492,14 +511,14 @@ flowchart TD
     DS --> BI
 ```
 
-| | Data Science | Machine Learning |
-|---|---|---|
-| **Foco** | Extrair **insights** dos dados | Construir **modelos preditivos** |
+|                     | Data Science                            | Machine Learning                            |
+| ------------------- | --------------------------------------- | ------------------------------------------- |
+| **Foco**            | Extrair **insights** dos dados          | Construir **modelos preditivos**            |
 | **Pergunta típica** | "Quais padrões existem nos roteadores?" | "Este roteador é comercial ou residencial?" |
-| **Ferramentas** | SQL, pandas, visualização, estatística | K-Means, regressão, redes neurais |
-| **Resultado** | Relatório, gráfico, decisão | Modelo treinado, API, automação |
-| **Precisa de ML?** | Às vezes | — |
-| **Precisa de DS?** | — | Sim, sempre |
+| **Ferramentas**     | SQL, pandas, visualização, estatística  | K-Means, regressão, redes neurais           |
+| **Resultado**       | Relatório, gráfico, decisão             | Modelo treinado, API, automação             |
+| **Precisa de ML?**  | Às vezes                                | —                                           |
+| **Precisa de DS?**  | —                                       | Sim, sempre                                 |
 
 **Data Science é o guarda-chuva.** É o processo completo: do problema ao insight. ML é uma **ferramenta dentro** desse processo — usada quando você precisa de **predição automática** ou **descoberta de padrões** que humanos não enxergam.
 
@@ -523,11 +542,11 @@ Você está fazendo **Data Science** (o processo completo) e usa **ML** (cluster
 
 ## 5.1 Quando usar ML vs programação tradicional?
 
-| Use **programação tradicional** se... | Use **ML** se... |
-|---|---|
-| A regra é **simples e conhecida** | A regra é **complexa ou desconhecida** |
-| Você consegue escrever os ifs | Há interações entre variáveis que você não enxerga |
-| O problema não muda com o tempo | O padrão muda e o modelo precisa se adaptar |
-| Você precisa de **explicabilidade total** | Você aceita uma "caixa preta" que funciona |
+| Use **programação tradicional** se...     | Use **ML** se...                                   |
+| ----------------------------------------- | -------------------------------------------------- |
+| A regra é **simples e conhecida**         | A regra é **complexa ou desconhecida**             |
+| Você consegue escrever os ifs             | Há interações entre variáveis que você não enxerga |
+| O problema não muda com o tempo           | O padrão muda e o modelo precisa se adaptar        |
+| Você precisa de **explicabilidade total** | Você aceita uma "caixa preta" que funciona         |
 
 **No projeto:** a regra `razao_comercial > 0.5` é simples e funciona. Mas e se existirem roteadores de **uso misto** (comércio embaixo, residência em cima)? A regra simples não captura isso. O clustering com K=3 ou K=4 pode descobrir um **terceiro grupo** que você nem imaginava. **Isso** é o valor do ML.

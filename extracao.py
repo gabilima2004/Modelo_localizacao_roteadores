@@ -7,14 +7,15 @@ ETAPA 2 DO PROJETO: COLETA DE DADOS
 
 Este arquivo é responsável por:
   1. Conectar ao QuestDB
-  2. Extrair a tabela `routers` (pequena, ~5000 linhas) de uma vez
-  3. Extrair a tabela `device_metrics` (enorme, ~864M linhas) por dia
-  4. Salvar tudo em arquivos locais (CSV ou Parquet)
+  2. Extrair a tabela `routers` (~6000 roteadores únicos, série temporal) de uma vez
+     e deduplicar pegando a versão mais recente de cada roteador
+  3. Extrair a tabela `device_metrics` (enorme, ~15,8M linhas/dia) por dia
+  4. Salvar tudo em arquivos locais (CSV ou Parquet) na pasta data/raw/
 
 ESTRATÉGIA DE AMOSTRAGEM:
-  - routers: tabela estática, poucas linhas → extrai tudo
-  - device_metrics: ~7,2M linhas por dia → extrai dia a dia, salva
-    cada dia em um arquivo separado na pasta data/
+  - routers: série temporal com ~12.000 linhas → deduplica e salva ~6.000 únicos
+  - device_metrics: ~15,8M linhas por dia → extrai dia a dia, salva
+    cada dia em um arquivo separado na pasta data/raw/
 
 COMO USAR:
   python extracao.py
@@ -38,18 +39,20 @@ from psycopg2.extras import RealDictCursor  # type: ignore
 
 # Dados de conexão com o QuestDB
 # QuestDB aceita conexões PostgreSQL na porta 8812 por padrão
-QUESTDB_HOST = "localhost"
+QUESTDB_HOST = "10.246.47.168"
 QUESTDB_PORT = 8812
 QUESTDB_USER = "admin"
 QUESTDB_PASSWORD = "quest"
 QUESTDB_DATABASE = "qdb"
 
 # Período de dados a extrair (formato: YYYY-MM-DD)
+#DATA_INICIO = "2025-04-01"
+#DATA_FIM = "2025-07-28"
 DATA_INICIO = "2025-04-01"
-DATA_FIM = "2025-07-24"
+DATA_FIM = "2025-04-02"
 
-# Pasta onde salvar os arquivos extraídos
-PASTA_DADOS = "data"
+# Pasta onde salvar os arquivos extraídos (dados brutos)
+PASTA_DADOS = "data/raw"
 
 # Formato de saída: "csv" ou "parquet"
 # Dica: comece com "csv" para entender o formato, depois mude para "parquet"
@@ -92,13 +95,13 @@ def conectar():
 def extrair_routers(conn):
     """Extrai a tabela `routers` (dados de localização dos roteadores).
 
-    Esta tabela é estática e pequena (~5000 linhas), então podemos
+    Esta tabela é pequena (~6000 linhas), então podemos
     trazer tudo de uma vez sem problema de memória.
 
     Retorna:
         DataFrame do pandas com os dados da tabela.
     """
-    query = "SELECT * FROM routers"
+    query = "SELECT  router_mac, timestamp, manufacturer, model, user_ppp, location, city, state, latitude, longitude FROM routers"
 
     print("[extrair_routers] Executando query...")
     with conn.cursor() as cur:
@@ -106,8 +109,10 @@ def extrair_routers(conn):
         rows = cur.fetchall()
 
     df = pd.DataFrame(rows)
-    print(f"[extrair_routers] {len(df)} roteadores extraídos")
-    return df
+    # Ordenar por timestamp (mais recente primeiro) e pegar o primeiro de cada router_mac
+    df_routers_unicos = df.sort_values("timestamp", ascending=False).drop_duplicates("router_mac", keep="first")
+    print(f"[extrair_routers] {len(df_routers_unicos)} roteadores extraídos")
+    return df_routers_unicos
 
 
 # ============================================================
@@ -136,7 +141,7 @@ def extrair_metrics_dia(conn, data):
     # timestamp >= '2025-04-01' AND timestamp < '2025-04-02'
     # Usamos < (menor que) e não <= para não pegar o dia seguinte
     query = f"""
-        SELECT * FROM device_metrics
+        SELECT device_mac, router_mac, timestamp, bytes_up, bytes_down, packets_up, packets_down FROM device_metrics
         WHERE timestamp >= '{data_str}'
           AND timestamp < '{dia_seguinte}'
     """
