@@ -48,8 +48,8 @@ QUESTDB_DATABASE = "qdb"
 # Período de dados a extrair (formato: YYYY-MM-DD)
 #DATA_INICIO = "2025-04-01"
 #DATA_FIM = "2025-07-28"
-DATA_INICIO = "2025-04-01"
-DATA_FIM = "2025-04-02"
+DATA_INICIO = "2026-04-01"
+DATA_FIM = "2026-04-07"
 
 # Pasta onde salvar os arquivos extraídos (dados brutos)
 PASTA_DADOS = "data/raw"
@@ -57,6 +57,11 @@ PASTA_DADOS = "data/raw"
 # Formato de saída: "csv" ou "parquet"
 # Dica: comece com "csv" para entender o formato, depois mude para "parquet"
 FORMATO_SAIDA = "csv"
+
+# Se True, deleta o CSV de métricas após processar as features
+# (Opção B: extrair, processar features, deletar dado bruto)
+# Isso economiza disco — 4 meses de CSV seriam ~180GB!
+DELETAR_APOS_PROCESSAR = True
 
 
 # ============================================================
@@ -201,6 +206,42 @@ def ja_existe(nome_arquivo):
 
 
 # ============================================================
+# FUNÇÃO 6: Deletar arquivo de dados brutos
+# ============================================================
+def deletar_arquivo(nome_arquivo):
+    """Deleta um arquivo de dados brutos após processar as features.
+
+    Isso economiza disco — os dados brutos (1,5GB/dia) não precisam
+    ficar guardados depois que as features (1MB/dia) foram calculadas.
+    """
+    if FORMATO_SAIDA == "csv":
+        caminho = os.path.join(PASTA_DADOS, f"{nome_arquivo}.csv")
+    else:
+        caminho = os.path.join(PASTA_DADOS, f"{nome_arquivo}.parquet")
+
+    if os.path.exists(caminho):
+        os.remove(caminho)
+        print(f"[deletar] {caminho} removido (liberou disco)")
+
+
+# ============================================================
+# FUNÇÃO 7: Verificar se as features de um dia já foram processadas
+# ============================================================
+def features_ja_processadas(nome_dia):
+    """Verifica se as features de um dia já foram processadas.
+
+    Com a Opção B (DELETAR_APOS_PROCESSAR=True), o CSV bruto é deletado
+    após processar. Então não podemos verificar data/raw/ — precisamos
+    verificar data/processed/features_YYYY-MM-DD.csv (o resultado).
+
+    Parâmetros:
+        nome_dia: string "YYYY-MM-DD"
+    """
+    caminho = os.path.join("data", "processed", f"features_{nome_dia}.csv")
+    return os.path.exists(caminho)
+
+
+# ============================================================
 # FUNÇÃO PRINCIPAL: Orquestra toda a extração
 # ============================================================
 def main():
@@ -209,9 +250,14 @@ def main():
     Passos:
     1. Conecta ao QuestDB
     2. Extrai e salva a tabela routers (se ainda não existir)
-    3. Para cada dia no período, extrai e salva device_metrics
-       (pulando dias já extraídos)
+    3. Para cada dia no período:
+       a. Extrai device_metrics e salva CSV
+       b. Processa as features (chama features.py)
+       c. Se DELETAR_APOS_PROCESSAR=True, deleta o CSV bruto
     4. Fecha a conexão
+
+    Isso é a "Opção B": extrair, processar features, deletar dado bruto.
+    Economiza disco — só ficam as features (pequenas), não os dados brutos.
     """
     print("=" * 60)
     print("  EXTRAÇÃO DE DADOS — MODELO RESIDENCIAL COMERCIAL")
@@ -236,9 +282,18 @@ def main():
             nome_dia = dia.strftime("%Y-%m-%d")
             nome_arquivo = f"metrics_{nome_dia}"
 
-            if ja_existe(nome_arquivo):
-                print(f"[main] ({i+1}/{len(dias)}) {nome_dia} já existe, pulando...")
-                continue
+            # Verificação depende do modo:
+            # - Se DELETAR_APOS_PROCESSAR=True: verifica as features (data/processed/)
+            #   (porque o CSV bruto foi deletado)
+            # - Se DELETAR_APOS_PROCESSAR=False: verifica o CSV bruto (data/raw/)
+            if DELETAR_APOS_PROCESSAR:
+                if features_ja_processadas(nome_dia):
+                    print(f"[main] ({i+1}/{len(dias)}) {nome_dia} já processado, pulando...")
+                    continue
+            else:
+                if ja_existe(nome_arquivo):
+                    print(f"[main] ({i+1}/{len(dias)}) {nome_dia} já existe, pulando...")
+                    continue
 
             df_dia = extrair_metrics_dia(conn, dia)
 
@@ -249,10 +304,36 @@ def main():
 
             salvar(df_dia, nome_arquivo)
 
+            # Se DELETAR_APOS_PROCESSAR=True, processa as features e deleta o bruto
+            if DELETAR_APOS_PROCESSAR:
+                print(f"[main] ({i+1}/{len(dias)}) Processando features de {nome_dia}...")
+                # Importa o features.py e processa este dia
+                import features
+                caminho_csv = os.path.join(PASTA_DADOS, f"{nome_arquivo}.csv")
+                features_dia = features.processar_dia(caminho_csv)
+
+                # Salva as features deste dia
+                os.makedirs("data/processed", exist_ok=True)
+                caminho_features = os.path.join("data/processed", f"features_{nome_dia}.csv")
+                features_dia.to_csv(caminho_features)
+                print(f"[main] Features salvas em {caminho_features}")
+
+                # Deleta o CSV bruto para liberar disco
+                deletar_arquivo(nome_arquivo)
+
     finally:
         # 4. Fecha a conexão (sempre, mesmo se houver erro)
         conn.close()
         print("[main] Conexão fechada.")
+
+    # 5. Consolida todas as features em um único arquivo
+    print("\n[main] Consolidando todas as features...")
+    import glob
+    arquivos_features = sorted(glob.glob("data/processed/features_*.csv"))
+    if len(arquivos_features) > 0:
+        todas_features = pd.concat([pd.read_csv(f) for f in arquivos_features])
+        todas_features.to_csv("data/processed/features_todos_dias.csv", index=False)
+        print(f"[main] {len(todas_features)} linhas consolidadas em features_todos_dias.csv")
 
     print("=" * 60)
     print("  EXTRAÇÃO CONCLUÍDA!")

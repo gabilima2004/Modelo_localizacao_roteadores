@@ -31,7 +31,85 @@ import os
 # ============================================================
 # Carregar as features (resultado da Etapa 4)
 # ============================================================
-df = pd.read_csv("data/processed/features_2026-04-01.csv", index_col="router_mac")
+# Tenta ler o arquivo consolidado (todos os dias).
+# Se não existir, lê o de um dia só (compatibilidade).
+import os
+
+if os.path.exists("data/processed/features_todos_dias.csv"):
+    df = pd.read_csv("data/processed/features_todos_dias.csv", index_col="router_mac")
+    print(f"[modelo] Lendo features_todos_dias.csv ({len(df)} linhas)")
+else:
+    df = pd.read_csv("data/processed/features_2026-04-01.csv", index_col="router_mac")
+    print(f"[modelo] Lendo features_2026-04-01.csv ({len(df)} linhas)")
+
+# ============================================================
+# AGREGAR: separar dias úteis de fins de semana (2 perfis)
+# ============================================================
+# O features_todos_dias.csv tem uma linha por roteador POR DIA.
+# O K-Means precisa de 1 linha por roteador. Mas não podemos simplesmente
+# fazer a média de todos os dias — isso dilui o sinal comercial
+# (uma loja tem tráfego alto em dias úteis e baixo em fds).
+#
+# Solução: criar 2 perfis por roteador:
+# - perfil_uteis: média das horas em dias úteis (seg-sex)
+# - perfil_fds: média das horas em fins de semana (sab-dom)
+#
+# Assim o K-Means vê a diferença de comportamento entre úteis e fds,
+# que é o sinal mais forte para distinguir comercial de residencial.
+if df.index.duplicated().any():
+    print(f"[modelo] Detectadas linhas duplicadas (múltiplos dias por roteador)")
+    print(f"[modelo] Agregando por roteador (2 perfis: úteis vs fds)...")
+
+    colunas_perfil = [f"h_{i}" for i in range(24)]
+
+    # Separar dias úteis de fins de semana
+    if "eh_fds" in df.columns:
+        df_uteis = df[df["eh_fds"] == False].copy()
+        df_fds = df[df["eh_fds"] == True].copy()
+        print(f"[modelo] Dias úteis: {len(df_uteis)} linhas")
+        print(f"[modelo] Fins de semana: {len(df_fds)} linhas")
+
+        # Agregar cada grupo por roteador (média do perfil horário)
+        agg_uteis = df_uteis.groupby(df_uteis.index)[colunas_perfil].mean()
+        agg_fds = df_fds.groupby(df_fds.index)[colunas_perfil].mean()
+
+        # Renomear colunas: h_0 → uteis_h_0, h_0 → fds_h_0
+        agg_uteis.columns = [f"uteis_{c}" for c in agg_uteis.columns]
+        agg_fds.columns = [f"fds_{c}" for c in agg_fds.columns]
+
+        # Juntar os 2 perfis (outer join mantém roteadores que só têm um tipo)
+        agregado = agg_uteis.join(agg_fds, how="outer")
+
+        # Preencher NaN com 0 (roteadores sem dados de fds, por exemplo)
+        agregado = agregado.fillna(0)
+
+        # Calcular razao_comercial média (de todos os dias)
+        if "razao_comercial" in df.columns:
+            razao_media = df.groupby(df.index)["razao_comercial"].mean()
+            agregado["razao_comercial"] = razao_media
+
+        # Recalcular hora_pico a partir do perfil de dias úteis
+        colunas_uteis = [f"uteis_h_{i}" for i in range(24)]
+        if all(c in agregado.columns for c in colunas_uteis):
+            agregado["hora_pico"] = (
+                agregado[colunas_uteis].idxmax(axis=1)
+                .str.replace("uteis_h_", "")
+                .astype(int)
+            )
+
+        df = agregado
+        print(f"[modelo] Após agregação: {len(df)} roteadores únicos")
+        print(f"[modelo] Features: {len(df.columns)} colunas (2 perfis × 24 horas + extras)")
+    else:
+        # Se não tem a coluna eh_fds, faz agregação simples (compatibilidade)
+        print(f"[modelo] Sem coluna eh_fds — agregação simples (média de todos os dias)")
+        colunas_media = [f"h_{i}" for i in range(24)] + ["razao_comercial"]
+        agregado = df.groupby(df.index)[[c for c in colunas_media if c in df.columns]].mean()
+        colunas_perfil = [f"h_{i}" for i in range(24)]
+        if all(c in agregado.columns for c in colunas_perfil):
+            agregado["hora_pico"] = agregado[colunas_perfil].idxmax(axis=1).str.replace("h_", "").astype(int)
+        df = agregado
+        print(f"[modelo] Após agregação: {len(df)} roteadores únicos")
 
 # ============================================================
 # FUNÇÃO 1: Regra de negócio (baseline)
@@ -89,9 +167,20 @@ def classificar_kmeans(df, k=2):
     Retorna:
         Series com o grupo (0 ou 1) de cada roteador
     """
-    # 1. Selecionar só as colunas do perfil horário (h_0 a h_23)
-    colunas_perfil = [f"h_{i}" for i in range(24)]
-    perfil = df[colunas_perfil]
+    # 1. Selecionar as colunas do perfil horário
+    # Se temos 2 perfis (úteis + fds), usar ambos. Senão, usar o perfil único.
+    colunas_uteis = [f"uteis_h_{i}" for i in range(24)]
+    colunas_fds = [f"fds_h_{i}" for i in range(24)]
+    colunas_simples = [f"h_{i}" for i in range(24)]
+
+    if all(c in df.columns for c in colunas_uteis):
+        # Modo 2 perfis: úteis + fds (48 colunas)
+        perfil = df[colunas_uteis + colunas_fds]
+        print(f"[kmeans] Usando 2 perfis (úteis + fds): {len(perfil.columns)} colunas")
+    else:
+        # Modo 1 perfil (compatibilidade)
+        perfil = df[colunas_simples]
+        print(f"[kmeans] Usando 1 perfil: {len(perfil.columns)} colunas")
 
     # 2. Normalizar por LINHA (cada roteador) — não por coluna!
     # Por que? Queremos comparar o PADRÃO (quando o tráfego acontece),
@@ -206,24 +295,38 @@ def comparar_metodos(regra, kmeans):
 def analisar_perfil_grupos(df, grupos):
     """Mostra o perfil horário médio de cada grupo do K-Means.
 
-    Isso ajuda a entender o comportamento de cada grupo:
-    - Grupo comercial: pico das 8h-17h
-    - Grupo residencial: pico das 18h-23h
+    Se houver 2 perfis (úteis + fds), mostra ambos separadamente
+    para comparar o comportamento em dias úteis vs fins de semana.
     """
-    colunas_perfil = [f"h_{i}" for i in range(24)]
     df_com_grupos = df.copy()
     df_com_grupos["grupo"] = grupos
 
-    # Calcular a média do tráfego por hora para cada grupo
-    perfil_medio = df_com_grupos.groupby("grupo")[colunas_perfil].mean()
+    # Verificar se temos 2 perfis ou 1
+    colunas_uteis = [f"uteis_h_{i}" for i in range(24)]
+    colunas_fds = [f"fds_h_{i}" for i in range(24)]
+    colunas_simples = [f"h_{i}" for i in range(24)]
 
-    print(f"[perfil] Perfil horário médio por grupo:")
-    for g in perfil_medio.index:
-        print(f"\n[perfil] Grupo {g}:")
-        # Mostrar as 5 horas com maior tráfego médio
-        top5 = perfil_medio.loc[g].nlargest(5)
-        for hora, valor in top5.items():
-            print(f"[perfil]   {hora}: {valor:,.0f} bytes")
+    tem_2_perfis = all(c in df.columns for c in colunas_uteis)
+
+    if tem_2_perfis:
+        # Mostrar 2 perfis separadamente
+        for tipo, colunas in [("DIAS ÚTEIS", colunas_uteis), ("FINS DE SEMANA", colunas_fds)]:
+            print(f"\n[perfil] === {tipo} ===")
+            perfil_medio = df_com_grupos.groupby("grupo")[colunas].mean()
+            for g in perfil_medio.index:
+                print(f"\n[perfil] Grupo {g}:")
+                top5 = perfil_medio.loc[g].nlargest(5)
+                for hora, valor in top5.items():
+                    print(f"[perfil]   {hora}: {valor:,.0f} bytes")
+    else:
+        # Mostrar 1 perfil (compatibilidade)
+        perfil_medio = df_com_grupos.groupby("grupo")[colunas_simples].mean()
+        print(f"[perfil] Perfil horário médio por grupo:")
+        for g in perfil_medio.index:
+            print(f"\n[perfil] Grupo {g}:")
+            top5 = perfil_medio.loc[g].nlargest(5)
+            for hora, valor in top5.items():
+                print(f"[perfil]   {hora}: {valor:,.0f} bytes")
 
     return perfil_medio
 
@@ -242,19 +345,56 @@ def main():
     # Mostrar informações dos dados carregados
     print(f"\n→ Dados carregados: {len(df)} roteadores × {len(df.columns)} features")
 
-    # 0. Remover outliers (roteadores com tráfego absurdamente alto)
-    # O K-Means é sensível a outliers — um roteador com tráfego 449x a mediana
-    # atrai um centroide só para ele e arruína o clustering.
-    print("\n→ Passo 0: Removendo outliers...")
-    colunas_perfil = [f"h_{i}" for i in range(24)]
-    trafego_total = df[colunas_perfil].sum(axis=1)
-    mediana = trafego_total.median()
-    mascara_sem_outlier = trafego_total < (mediana * 100)
-    outliers = ~mascara_sem_outlier
-    print(f"   Mediana do tráfego total: {mediana:,.0f}")
-    print(f"   Outliers removidos: {outliers.sum()}")
-    print(f"   Roteadores restantes: {mascara_sem_outlier.sum()}")
-    df = df[mascara_sem_outlier]
+    # 0. Identificar outliers por PADRÃO PLANO (não por volume)
+    # Depois da normalização L1, o volume não existe mais. O problema do
+    # outlier é o PADRÃO: um roteador com tráfego igual em todas as horas
+    # (perfil plano, sem pico) é anômalo e atrai um centroide só para ele.
+    #
+    # Como detectar perfil plano? Calculamos o desvio padrão (std) do
+    # perfil normalizado. Perfil plano → std baixo. Perfil com pico → std alto.
+    print("\n→ Passo 0: Identificando outliers (padrão plano)...")
+
+    # Selecionar as colunas do perfil (depende do modo: 2 perfis ou 1)
+    colunas_uteis = [f"uteis_h_{i}" for i in range(24)]
+    colunas_fds = [f"fds_h_{i}" for i in range(24)]
+    colunas_simples = [f"h_{i}" for i in range(24)]
+
+    if all(c in df.columns for c in colunas_uteis):
+        # Modo 2 perfis: usar dias úteis para detectar padrão plano
+        perfil = df[colunas_uteis]
+        print("   Usando perfil de dias úteis para detectar outliers")
+    else:
+        # Modo 1 perfil
+        perfil = df[colunas_simples]
+
+    # Normalizar com L1 (cada perfil soma 1)
+    soma_por_router = perfil.sum(axis=1)
+    perfil_normalizado = perfil.div(soma_por_router, axis=0)
+
+    # Calcular o std de cada perfil normalizado
+    # Perfil plano: std ≈ 0 (todas as horas iguais)
+    # Perfil com pico: std alto (umas horas muito maiores que outras)
+    std_perfil = perfil_normalizado.std(axis=1)
+
+    # Threshold: perfis com std muito baixo são planos (anômalos)
+    # Usamos o 1º percentil — os 1% mais planos são outliers
+    threshold = std_perfil.quantile(0.01)
+    mascara_outlier = std_perfil < threshold
+    mascara_normal = ~mascara_outlier
+
+    print(f"   Std médio dos perfis: {std_perfil.mean():.4f}")
+    print(f"   Threshold (1º percentil): {threshold:.4f}")
+    print(f"   Outliers (padrão plano): {mascara_outlier.sum()}")
+    print(f"   Roteadores normais: {mascara_normal.sum()}")
+
+    # Separar outliers e normais
+    df_outliers = df[mascara_outlier].copy()
+    df = df[mascara_normal].copy()
+
+    # Classificar outliers como "padrao_anomalo"
+    classificacao_outliers = pd.Series(
+        "padrao_anomalo", index=df_outliers.index, name="classificacao_kmeans"
+    )
 
     # 1. Regra de negócio
     print("\n" + "=" * 60)
@@ -297,24 +437,36 @@ def main():
     resultado["classificacao_kmeans"] = classificacao_kmeans
     resultado["concorda"] = resultado["classificacao_regra"] == resultado["classificacao_kmeans"]
 
+    # Adicionar os outliers classificados como "padrao_anomalo"
+    resultado_outliers = df_outliers.copy()
+    resultado_outliers["classificacao_regra"] = "padrao_anomalo"
+    resultado_outliers["classificacao_kmeans"] = "padrao_anomalo"
+    resultado_outliers["concorda"] = True  # ambos concordam que é anômalo
+
+    # Juntar normais + outliers
+    resultado = pd.concat([resultado, resultado_outliers])
+
     # Salvar
     os.makedirs("data/processed", exist_ok=True)
     resultado.to_csv("data/processed/classificacao_ia_2026-04-01.csv")
     print(f"✅ Resultado salvo em data/processed/classificacao_ia_2026-04-01.csv")
     print(f"   {len(resultado)} roteadores classificados")
+    print(f"   - Normais: {len(df)}")
+    print(f"   - Padrão anômalo: {len(df_outliers)}")
 
     # Resumo final
     print("\n" + "=" * 60)
     print("  RESUMO FINAL")
     print("=" * 60)
-    print(f"  Regra de negócio:")
-    print(f"    Comercial:    {(classificacao_regra == 'comercial').sum()}")
-    print(f"    Residencial:  {(classificacao_regra == 'residencial').sum()}")
-    print(f"  K-Means:")
-    print(f"    Comercial:    {(classificacao_kmeans == 'comercial').sum()}")
-    print(f"    Residencial:  {(classificacao_kmeans == 'residencial').sum()}")
+    print(f"  Regra de negócio (roteadores normais):")
+    print(f"    Comercial:      {(classificacao_regra == 'comercial').sum()}")
+    print(f"    Residencial:    {(classificacao_regra == 'residencial').sum()}")
+    print(f"  K-Means (roteadores normais):")
+    print(f"    Comercial:      {(classificacao_kmeans == 'comercial').sum()}")
+    print(f"    Residencial:    {(classificacao_kmeans == 'residencial').sum()}")
+    print(f"  Outliers (padrão anômalo): {len(df_outliers)}")
     concordancia = (classificacao_regra == classificacao_kmeans).mean() * 100
-    print(f"  Concordância:  {concordancia:.1f}%")
+    print(f"  Concordância (normais):  {concordancia:.1f}%")
     print("=" * 60)
     print("  MODELAGEM CONCLUÍDA!")
     print("=" * 60)

@@ -17,39 +17,53 @@ FLUXO:
   6. hora_pico()              → hora de maior tráfego por roteador
   7. perfil_horario()         → 24 valores de tráfego por roteador
   8. main()                   → junta tudo em uma tabela final
+
+MÚLTIPLOS DIAS:
+  Este script processa TODOS os dias encontrados na pasta data/raw/
+  (arquivos metrics_YYYY-MM-DD.csv). Para cada dia:
+  1. Carrega o CSV
+  2. Calcula as features
+  3. Adiciona coluna 'data' e 'dia_semana' (0=segunda, 6=domingo)
+  4. Acumula no resultado final
+  5. Salva tudo em data/processed/features_todos_dias.csv
+
+  Isso permite analisar dias úteis vs fins de semana separadamente.
 ============================================================
 """
 
 import pandas as pd
+import os
+import glob
+
+try:
+    import holidays
+    FERIADOS = holidays.Brazil(state="RJ")
+except ImportError:
+    print("[features] Biblioteca 'holidays' não instalada — feriados não serão considerados")
+    FERIADOS = None
 
 # ============================================================
-# Carregar os dados (dados brutos em data/raw/)
+# Configurações
 # ============================================================
-df_metrics = pd.read_csv("data/raw/metrics_2026-04-01.csv", parse_dates=["timestamp"])
+PASTA_RAW = "data/raw"
+PASTA_PROCESSED = "data/processed"
 
 
 # ============================================================
 # FUNÇÃO 1: Calcular deltas (tráfego real por minuto)
 # ============================================================
-def calcular_deltas():
+def calcular_deltas(df_metrics):
     """Calcula o tráfego real por minuto a partir dos bytes acumulados.
 
-    Os bytes_up e bytes_down são contadores acumulados (desde que o
-    roteador ligou). O tráfego real de cada minuto é a DIFERENÇA
-    entre o valor atual e o anterior (diff).
-
-    Quando o delta é negativo, o contador reiniciou (roteador desligou).
-    Nesse caso, o tráfego real é o próprio valor (bytes_up desde o reinício).
+    Recebe o DataFrame como parâmetro (em vez de usar variável global).
     """
     # Extrair a hora do timestamp (0-23)
     df_metrics["hora"] = df_metrics["timestamp"].dt.hour
 
     # Calcular diff agrupado por device_mac
-    # (cada device tem seu próprio contador, não pode misturar)
     df_metrics["delta_bytes_up"] = df_metrics.groupby("device_mac")["bytes_up"].diff()
 
     # Tratar reinício: se delta < 0, o contador reiniciou
-    # O tráfego real é o próprio bytes_up (novo valor desde o reinício)
     df_metrics.loc[df_metrics["delta_bytes_up"] < 0, "delta_bytes_up"] = df_metrics["bytes_up"]
 
     # Mesma lógica para bytes_down
@@ -57,23 +71,15 @@ def calcular_deltas():
     df_metrics.loc[df_metrics["delta_bytes_down"] < 0, "delta_bytes_down"] = df_metrics["bytes_down"]
 
     print(f"[calcular_deltas] Deltas calculados para {len(df_metrics)} linhas")
+    return df_metrics
 
 
 # ============================================================
 # FUNÇÃO 2: Tráfego por roteador por hora
 # ============================================================
-def trafego_por_hora():
-    """Agrupa os deltas por roteador + hora e soma.
-
-    Retorna um DataFrame onde:
-    - Índice: router_mac + hora
-    - Colunas: delta_bytes_up, delta_bytes_down
-
-    Este DataFrame é a BASE para todas as outras features.
-    Todas as funções seguintes recebem este DataFrame como parâmetro.
-    """
+def trafego_por_hora(df_metrics):
+    """Agrupa os deltas por roteador + hora e soma."""
     trafego = df_metrics.groupby(["router_mac", "hora"])[["delta_bytes_up", "delta_bytes_down"]].sum()
-
     print(f"[trafego_por_hora] {len(trafego)} linhas (roteador × hora)")
     return trafego
 
@@ -82,21 +88,10 @@ def trafego_por_hora():
 # FUNÇÃO 3: Tráfego comercial (8h-17h)
 # ============================================================
 def trafego_comercial(trafego):
-    """Soma o tráfego das horas comerciais (8h-17h) para cada roteador.
-
-    Recebe o DataFrame 'trafego' (resultado de trafego_por_hora)
-    e filtra só as horas 8-17, depois soma por roteador.
-    """
-    # reset_index() transforma o índice (router_mac, hora) em colunas normais
-    # Isso facilita filtrar por hora
+    """Soma o tráfego das horas comerciais (8h-17h) para cada roteador."""
     trafego_reset = trafego.reset_index()
-
-    # Filtrar só as horas comerciais (8 a 17)
     comercial = trafego_reset[trafego_reset["hora"].isin(range(8, 18))]
-
-    # Agrupar por roteador e somar
     comercial = comercial.groupby("router_mac")[["delta_bytes_up", "delta_bytes_down"]].sum()
-
     print(f"[trafego_comercial] {len(comercial)} roteadores")
     return comercial
 
@@ -105,68 +100,39 @@ def trafego_comercial(trafego):
 # FUNÇÃO 4: Tráfego residencial (18h-7h)
 # ============================================================
 def trafego_residencial(trafego):
-    """Soma o tráfego das horas residenciais (18h-7h) para cada roteador.
-
-    O período residencial é das 18h até as 7h (inclui madrugada).
-    Isso significa hora >= 18 OU hora < 8.
-    """
+    """Soma o tráfego das horas residenciais (18h-7h) para cada roteador."""
     trafego_reset = trafego.reset_index()
-
-    # Filtrar horas residenciais: hora >= 18 OU hora < 8
     residencial = trafego_reset[
         (trafego_reset["hora"] >= 18) | (trafego_reset["hora"] < 8)
     ]
-
-    # Agrupar por roteador e somar
     residencial = residencial.groupby("router_mac")[["delta_bytes_up", "delta_bytes_down"]].sum()
-
     print(f"[trafego_residencial] {len(residencial)} roteadores")
     return residencial
 
 
 # ============================================================
-# FUNÇÃO 5: Razão comercial (proporção do tráfego que é comercial)
+# FUNÇÃO 5: Razão comercial
 # ============================================================
 def razao_comercial(comercial, residencial):
-    """Calcula a proporção do tráfego que é comercial.
-
-    razao = trafego_comercial / (trafego_comercial + trafego_residencial)
-
-    Se razao > 0.5 → a maioria do tráfego é comercial → provavelmente comercial
-    Se razao < 0.5 → a maioria do tráfego é residencial → provavelmente residencial
-    """
-    # Somar up + down para ter o tráfego total de cada período
+    """Calcula a proporção do tráfego que é comercial."""
     total_comercial = comercial["delta_bytes_up"] + comercial["delta_bytes_down"]
     total_residencial = residencial["delta_bytes_up"] + residencial["delta_bytes_down"]
-
-    # Razão = comercial / (comercial + residencial)
     razao = total_comercial / (total_comercial + total_residencial)
-
     print(f"[razao_comercial] {len(razao)} roteadores")
     return razao
 
 
 # ============================================================
-# FUNÇÃO 6: Hora de pico (hora de maior tráfego)
+# FUNÇÃO 6: Hora de pico
 # ============================================================
 def hora_pico(trafego):
-    """Encontra a hora de maior tráfego (up + down) para cada roteador.
-
-    Para cada roteador, qual hora teve o maior tráfego total?
-    """
-    # Somar up + down para ter o tráfego total por hora
+    """Encontra a hora de maior tráfego para cada roteador."""
     trafego_reset = trafego.reset_index()
     trafego_reset["trafego_total"] = (
         trafego_reset["delta_bytes_up"] + trafego_reset["delta_bytes_down"]
     )
-
-    # Para cada roteador, achar a hora com maior tráfego_total
-    # idxmax() retorna o ÍNDICE do maior valor
     pico = trafego_reset.groupby("router_mac")["trafego_total"].idxmax()
-
-    # idxmax retorna o índice da linha (número), precisamos pegar a hora
     horas_pico = trafego_reset.loc[pico, ["router_mac", "hora"]].set_index("router_mac")["hora"]
-
     print(f"[hora_pico] {len(horas_pico)} roteadores")
     return horas_pico
 
@@ -175,27 +141,28 @@ def hora_pico(trafego):
 # FUNÇÃO 7: Perfil horário (24 valores por roteador)
 # ============================================================
 def perfil_horario(trafego):
-    """Cria um perfil horário: 24 colunas (uma por hora) para cada roteador.
+    """Cria um perfil horário: 24 colunas para cada roteador.
 
-    Transforma o DataFrame de formato longo (router, hora, valor)
-    para formato largo (router, h_0, h_1, ..., h_23).
-
-    Isso é útil para o K-Means: cada roteador vira um ponto em
-    um espaço de 24 dimensões.
+    Garante que SEMPRE existam 24 colunas (h_0 a h_23), mesmo se
+    algumas horas não tiverem dados (preenchidas com zero).
+    Isso evita erros quando um dia tem dados de poucas horas.
     """
-    # Somar up + down para ter o tráfego total por hora
     trafego_reset = trafego.reset_index()
     trafego_reset["trafego_total"] = (
         trafego_reset["delta_bytes_up"] + trafego_reset["delta_bytes_down"]
     )
-
-    # pivot: transforma a coluna "hora" em 24 colunas (h_0, h_1, ..., h_23)
     perfil = trafego_reset.pivot_table(
-        index="router_mac",      # cada linha = um roteador
-        columns="hora",          # cada coluna = uma hora
-        values="trafego_total",  # os valores = tráfego total
-        fill_value=0             # se não tem dados para uma hora, preenche com 0
+        index="router_mac",
+        columns="hora",
+        values="trafego_total",
+        fill_value=0
     )
+
+    # GARANTIR 24 COLUNAS (h_0 a h_23)
+    # Se um dia tem dados de poucas horas, o pivot cria só algumas colunas.
+    # Reindex adiciona as horas que faltam, preenchidas com zero.
+    todas_horas = list(range(24))
+    perfil = perfil.reindex(columns=todas_horas, fill_value=0)
 
     # Renomear as colunas para h_0, h_1, ..., h_23
     perfil.columns = [f"h_{int(h)}" for h in perfil.columns]
@@ -205,31 +172,50 @@ def perfil_horario(trafego):
 
 
 # ============================================================
-# FUNÇÃO PRINCIPAL: Junta tudo em uma tabela final
+# FUNÇÃO 8: Processar um único dia
 # ============================================================
-def main():
-    """Orquestra todas as funções e cria a tabela final de features.
+def processar_dia(caminho_csv):
+    """Processa um único arquivo de métricas e retorna as features.
 
-    A tabela final tem 1 linha por roteador com todas as features:
-    - trafego_comercial_up
-    - trafego_comercial_down
-    - trafego_residencial_up
-    - trafego_residencial_down
-    - razao_comercial
-    - hora_pico
-    - h_0, h_1, ..., h_23 (perfil horário)
+    Parâmetros:
+        caminho_csv: caminho para o arquivo metrics_YYYY-MM-DD.csv
+
+    Retorna:
+        DataFrame com as features do dia (1 linha por roteador)
     """
-    print("=" * 60)
-    print("  ENGENHARIA DE FEATURES — ETAPA 4")
-    print("=" * 60)
+    # Extrair a data do nome do arquivo (metrics_2026-04-01.csv → 2026-04-01)
+    nome_arquivo = os.path.basename(caminho_csv)
+    data_str = nome_arquivo.replace("metrics_", "").replace(".csv", "")
+    data = pd.Timestamp(data_str)
 
-    # 1. Calcular deltas (modifica df_metrics)
+    # 0 = segunda, 6 = domingo
+    dia_semana = data.dayofweek
+
+    # Verificar se é feriado (nacional ou estadual do RJ)
+    eh_feriado = FERIADOS is not None and data in FERIADOS
+
+    # eh_fds = True se sábado, domingo OU feriado
+    # Feriados têm comportamento de fim de semana (comércio fecha)
+    eh_fds = (dia_semana >= 5) or eh_feriado
+
+    if eh_feriado:
+        print(f"  → {data_str} é feriado! Tratando como não útil")
+
+    print(f"\n{'='*60}")
+    print(f"  Processando dia {data_str} ({['seg','ter','qua','qui','sex','sab','dom'][dia_semana]})")
+    print(f"{'='*60}")
+
+    # Carregar os dados
+    df_metrics = pd.read_csv(caminho_csv, parse_dates=["timestamp"])
+    print(f"→ Carregado: {len(df_metrics)} linhas")
+
+    # 1. Calcular deltas
     print("\n→ Passo 1: Calculando deltas...")
-    calcular_deltas()
+    df_metrics = calcular_deltas(df_metrics)
 
     # 2. Agrupar por roteador + hora
     print("\n→ Passo 2: Agrupando por roteador + hora...")
-    trafego = trafego_por_hora()
+    trafego = trafego_por_hora(df_metrics)
 
     # 3. Calcular tráfego comercial
     print("\n→ Passo 3: Calculando tráfego comercial (8h-17h)...")
@@ -251,49 +237,101 @@ def main():
     print("\n→ Passo 7: Calculando perfil horário (24 valores)...")
     perfil = perfil_horario(trafego)
 
-    # 8. Juntar tudo em uma tabela final
-    print("\n→ Passo 8: Montando tabela final...")
-
-    # Renomear colunas para evitar conflitos
+    # 8. Montar tabela do dia
+    print("\n→ Passo 8: Montando tabela do dia...")
     comercial.columns = ["trafego_comercial_up", "trafego_comercial_down"]
     residencial.columns = ["trafego_residencial_up", "trafego_residencial_down"]
 
-    # Juntar tudo usando join (pelo índice router_mac)
-    tabela = comercial.join(residencial)          # junta comercial + residencial
-    tabela["razao_comercial"] = razao              # adiciona razão
-    tabela["hora_pico"] = pico                     # adiciona hora de pico
-    tabela = tabela.join(perfil)                   # adiciona perfil horário (24 colunas)
+    tabela = comercial.join(residencial)
+    tabela["razao_comercial"] = razao
+    tabela["hora_pico"] = pico
+    tabela = tabela.join(perfil)
 
-    print(f"\n✅ Tabela final: {len(tabela)} roteadores × {len(tabela.columns)} features")
-    print(f"   Colunas: {list(tabela.columns)}")
+    # Adicionar colunas de data e dia da semana
+    tabela["data"] = data_str
+    tabela["dia_semana"] = dia_semana  # 0=segunda, 6=domingo
+    tabela["eh_fds"] = eh_fds           # True se sábado ou domingo
 
     # 9. Filtrar roteadores com dados insuficientes
-    # Roteadores com 20+ horas zeradas não têm informação suficiente
-    # para classificar (só têm 4 horas ou menos de tráfego)
     print("\n→ Passo 9: Filtrando roteadores com dados insuficientes...")
     horas_zero = (tabela[[f"h_{i}" for i in range(24)]] == 0).sum(axis=1)
-    print(f"   Roteadores com 24h zeradas: {(horas_zero == 24).sum()}")
-    print(f"   Roteadores com 20+ horas zeradas: {(horas_zero >= 20).sum()}")
-
-    # Manter só roteadores com menos de 20 horas zeradas
     tabela = tabela[horas_zero < 20]
     print(f"   Roteadores após filtro: {len(tabela)}")
 
-    # Mostrar as primeiras linhas
-    print("\n=== PRIMEIRAS 5 LINHAS ===")
-    print(tabela.head())
-
-    # Salvar em arquivo (dados processados em data/processed/)
-    import os
-    os.makedirs("data/processed", exist_ok=True)
-    tabela.to_csv("data/processed/features_2026-04-01.csv")
-    print(f"\n✅ Features salvas em data/processed/features_2026-04-01.csv")
-
-    print("=" * 60)
-    print("  ENGENHARIA DE FEATURES CONCLUÍDA!")
-    print("=" * 60)
+    # Libera memória (df_metrics não é mais necessário)
+    del df_metrics
 
     return tabela
+
+
+# ============================================================
+# FUNÇÃO PRINCIPAL: Processa todos os dias e junta tudo
+# ============================================================
+def main():
+    """Processa todos os arquivos de métricas na pasta data/raw/.
+
+    Para cada arquivo metrics_YYYY-MM-DD.csv:
+    1. Carrega os dados
+    2. Calcula as features
+    3. Adiciona colunas 'data', 'dia_semana' e 'eh_fds'
+    4. Acumula no resultado final
+
+    No final, salva tudo em data/processed/features_todos_dias.csv
+    """
+    print("=" * 60)
+    print("  ENGENHARIA DE FEATURES — ETAPA 4")
+    print("=" * 60)
+
+    # Encontrar todos os arquivos de métricas na pasta data/raw/
+    arquivos = sorted(glob.glob(os.path.join(PASTA_RAW, "metrics_*.csv")))
+    print(f"\n→ Encontrados {len(arquivos)} arquivos de métricas")
+
+    if len(arquivos) == 0:
+        print("❌ Nenhum arquivo encontrado em data/raw/")
+        print("   Rode o extracao.py primeiro!")
+        return
+
+    # Processar cada dia e acumular
+    todas_features = []
+
+    for i, caminho in enumerate(arquivos):
+        print(f"\n→ Processando arquivo {i+1}/{len(arquivos)}...")
+        try:
+            features_dia = processar_dia(caminho)
+            todas_features.append(features_dia)
+            print(f"   ✅ {len(features_dia)} roteadores processados")
+        except Exception as e:
+            print(f"   ❌ Erro ao processar {caminho}: {e}")
+            continue
+
+    # Juntar todos os dias
+    print(f"\n{'='*60}")
+    print("  Juntando todos os dias...")
+    print(f"{'='*60}")
+
+    tabela_final = pd.concat(todas_features)
+    print(f"✅ Tabela final: {len(tabela_final)} linhas × {len(tabela_final.columns)} colunas")
+    print(f"   Dias processados: {tabela_final['data'].nunique()}")
+    print(f"   Roteadores únicos: {tabela_final.index.nunique()}")
+
+    # Mostrar distribuição por dia da semana
+    print(f"\n→ Distribuição por dia da semana:")
+    dias = ['seg', 'ter', 'qua', 'qui', 'sex', 'sab', 'dom']
+    for d in range(7):
+        qtd = (tabela_final['dia_semana'] == d).sum()
+        print(f"   {dias[d]}: {qtd} roteadores-dia")
+
+    # Salvar
+    os.makedirs(PASTA_PROCESSED, exist_ok=True)
+    caminho_saida = os.path.join(PASTA_PROCESSED, "features_todos_dias.csv")
+    tabela_final.to_csv(caminho_saida)
+    print(f"\n✅ Features salvas em {caminho_saida}")
+
+    print(f"\n{'='*60}")
+    print("  ENGENHARIA DE FEATURES CONCLUÍDA!")
+    print(f"{'='*60}")
+
+    return tabela_final
 
 
 # ============================================================
