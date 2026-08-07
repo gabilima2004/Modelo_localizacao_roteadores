@@ -6,20 +6,25 @@ Este projeto é um modelo de classificação de roteadores em um banco de dados 
 
 ## Metodologia
 
-A classificação é baseada na análise do tráfego de dados por períodos do dia:
+A classificação é baseada na análise do tráfego de dados considerando **dois fatores principais**:
 
-- **Período comercial:** das **8h às 18h**
-- **Período residencial:** fora do horário comercial (das 18h às 8h)
+1. **Horário do dia:**
+   - **Período comercial:** das **8h às 18h**
+   - **Período residencial:** fora do horário comercial (das 18h às 8h)
+
+2. **Tipo de dia (Sazonalidade):**
+   - **Dias úteis:** segunda a sexta (não feriados)
+   - **Fins de semana e feriados:** sábado, domingo e feriados nacionais/estaduais (RJ)
 
 ### Critério de Classificação
 
 O projeto usa **duas abordagens** em paralelo:
 
-1. **Regra de negócio (baseline, NÃO é ML):** se a maioria do tráfego (>50%) ocorre no horário comercial, o roteador é classificado como comercial. Caso contrário, residencial.
+1. **Regra de negócio (baseline, NÃO é ML):** se a maioria do tráfego (>50%) ocorre no horário comercial (em dias úteis), o roteador é classificado como comercial. Caso contrário, residencial.
 
-2. **K-Means (clustering, É ML — não supervisionado):** agrupa roteadores por similaridade do perfil horário (24 valores de tráfego por hora). O algoritmo encontra os grupos sozinho; depois interpretamos qual grupo é comercial e qual é residencial.
+2. **K-Means (clustering, É ML — não supervisionado):** agrupa roteadores por similaridade do perfil horário. O modelo cria dois perfis para cada roteador (dias úteis e fins de semana) e usa uma **votação por mês** para definir a classificação final, garantindo robustez contra meses atípicos (ex: férias escolares, eventos esportivos).
 
-3. **Comparação:** se os dois métodos concordam, ganhamos confiança. Se discordam, investigamos os casos especiais.
+3. **Comparação:** se os dois métodos concordam (91.9% dos casos), ganhamos confiança. Se discordam, investigamos os casos especiais.
 
 ### Detecção de outliers
 
@@ -56,23 +61,33 @@ Os dados estão armazenados no **QuestDB** e são distribuídos em duas tabelas 
 
 ```
 Modelo_localizacao_roteadores/
-├── extracao.py          # Etapa 2: extração do QuestDB (extrair, processar, deletar)
-├── eda.py               # Etapa 3: EDA da tabela routers
-├── eda_metrics.py       # Etapa 3: EDA da tabela device_metrics
-├── conclusoes_eda.md   # Etapa 3: conclusões da EDA
-├── features.py          # Etapa 4: engenharia de features (múltiplos dias)
-├── modelo_ia.py         # Etapa 5: modelagem (regra + K-Means) [gerado por IA]
-├── modelo.py            # (vazio, reservado)
+├── extracao.py                    # Etapa 2: extração do QuestDB (extrair, processar, deletar)
+├── eda.py                         # Etapa 3: EDA da tabela routers
+├── eda_metrics.py                 # Etapa 3: EDA da tabela device_metrics
+├── features.py                    # Etapa 4: engenharia de features (múltiplos dias)
+├── modelo_ia.py                   # Etapa 5: modelagem (regra + K-Means com votação por mês)
+├── modelo_hdbscan_ia.py           # Etapa 5: modelagem alternativa (HDBSCAN)
+├── avaliacao_ia.py                # Etapa 6: avaliação com localização
+├── graficos_ia.py                 # Etapa 6: geração de gráficos
+├── comparacao_humana_ia.py        # Etapa 6: comparação com análise humana (Grafana)
+├── validacao_manual_ia.py         # Etapa 6: validação manual (20 endereços)
+├── analise_volume_sazonalidade_ia.py  # Etapa 6: análise de volume e sazonalidade
+├── teste_normalizacao_ia.py       # Etapa 6: teste de normalizações (L1, L2, Z-Score)
+├── pipeline_ia.py                 # Etapa 7: pipeline automatizado
+├── modelo.py                      # (vazio, reservado)
 ├── data/
-│   ├── raw/             # dados brutos (temporários, deletados após processar)
-│   └── processed/       # features e classificações (pequenos, permanentes)
-├── readme.md            # este arquivo
-├── questdb.md           # documentação sobre QuestDB
-├── material_estudo.md   # material teórico (ML, estatística, K-Means)
-├── feedback.md          # feedback do professor
-├── prompt.md            # prompt para IAs (modo professor)
-├── explicacao_modelo_ia.md  # explicação detalhada do modelo_ia.py
-└── historico_alteracoes.md  # histórico de alterações do projeto
+│   ├── raw/                       # dados brutos (temporários, deletados após processar)
+│   └── processed/                 # features e classificações (pequenos, permanentes)
+│       └── graficos/              # gráficos PNG gerados
+├── graficos/                      # cópia dos gráficos PNG
+├── docs/                          # documentação
+│   ├── projeto.md                 # documentação técnica
+│   ├── referencia.md              # teoria e referências
+│   └── prompt.md                  # prompt para IAs (modo professor)
+├── readme.md                      # este arquivo
+├── relatorio_final_ia.md          # relatório final de insights
+├── material_estudo.md             # material teórico (ML, estatística, K-Means)
+└── feedback.md                    # feedback do professor
 ```
 
 ## Como Funciona
@@ -82,7 +97,7 @@ Modelo_localizacao_roteadores/
 2. **Análise exploratória (`eda.py`, `eda_metrics.py`):** explora os dados antes de modelar. Verifica dados faltantes, distribuições, outliers, tipos de colunas.
 
 3. **Engenharia de features (`features.py`):** transforma os bytes acumulados em tráfego real por minuto (diff), agrupa por roteador e hora, calcula:
-   - Tráfego comercial (8h-17h) e residencial (18h-7h)
+   - Tráfego comercial (8h-18h) e residencial (18h-7h)
    - Razão comercial (proporção do tráfego que é comercial)
    - Hora de pico
    - Perfil horário (24 valores: h_0 a h_23)
@@ -107,4 +122,30 @@ No final, todas as features são consolidadas em um único arquivo (~120 MB para
 
 ## Avaliação
 
-A avaliação será feita verificando a localização de alguns roteadores, avaliando se é um endereço residencial ou comercial. Será usada a coluna `eh_fds` para comparar o comportamento em dias úteis vs fins de semana.
+A avaliação foi feita de três formas:
+
+1. **Validação humana (Grafana):** 4 roteadores analisados visualmente no Grafana. Resultado: 100% de acerto (regra e K-Means).
+
+2. **Validação manual (endereços):** 20 roteadores analisados olhando o endereço no Google Maps. O script `validacao_manual_ia.py` faz a comparação. Indicadores usados: "CASA"/"Ap." = residencial, "LOJA"/"sala" = comercial.
+
+3. **Comparação regra vs K-Means:** 91.9% de concordância entre os dois métodos. Quando concordam, ganhamos confiança. Quando discordam, investigamos caso a caso.
+
+### Resultados (111 dias, 5.650 roteadores)
+
+| Métrica                       | Valor         |
+| ----------------------------- | ------------- |
+| Roteadores analisados         | 5.650         |
+| Comerciais                    | 453 (8.0%)    |
+| Residenciais                  | 5.135 (90.9%) |
+| Padrão anômalo                | 62 (1.1%)     |
+| Concordância regra vs K-Means | 91.9%         |
+| Silhouette Score              | 0.4711        |
+| Validação humana (Grafana)    | 100% (4/4)    |
+
+### Gráficos
+
+Os gráficos estão em `graficos/` (ou `data/processed/graficos/`). Os mais importantes:
+
+- **`04_perfil_horario_comparativo.png`** — perfil horário: comercial vs residencial, úteis vs fds (o gráfico mais importante do projeto)
+- **`06_volume_boxplot.png`** — distribuição de volume total por grupo (ver Seção 5.2 do relatório final)
+- **`08_por_cidade.png`** — comercial vs residencial por cidade

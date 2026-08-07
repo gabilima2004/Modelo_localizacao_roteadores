@@ -29,6 +29,7 @@ COMO USAR:
 """
 
 import os
+import time
 import pandas as pd
 import psycopg2  # type: ignore
 from psycopg2.extras import RealDictCursor  # type: ignore
@@ -49,7 +50,7 @@ QUESTDB_DATABASE = "qdb"
 #DATA_INICIO = "2025-04-01"
 #DATA_FIM = "2025-07-28"
 DATA_INICIO = "2026-04-01"
-DATA_FIM = "2026-04-07"
+DATA_FIM = "2026-07-20"
 
 # Pasta onde salvar os arquivos extraídos (dados brutos)
 PASTA_DADOS = "data/raw"
@@ -100,13 +101,20 @@ def conectar():
 def extrair_routers(conn):
     """Extrai a tabela `routers` (dados de localização dos roteadores).
 
-    Esta tabela é pequena (~6000 linhas), então podemos
-    trazer tudo de uma vez sem problema de memória.
+    Esta tabela é uma série temporal — cada atualização de cadastro cria
+    uma nova linha. Alguns roteadores têm dezenas de linhas (bug de coleta
+    que recria o registro com location=null).
 
-    Retorna:
-        DataFrame do pandas com os dados da tabela.
+    Estratégia de deduplicação:
+    1. Ordenar por timestamp (mais recente primeiro)
+    2. Priorizar linhas que TÊM location (não null)
+    3. Pegar a primeira linha de cada router_mac
+
+    Assim, se a linha mais recente tem location=null (bug de coleta),
+    mas uma linha anterior tem endereço, usamos a anterior.
+    Isso recupera roteadores que estavam sem localização.
     """
-    query = "SELECT  router_mac, timestamp, manufacturer, model, user_ppp, location, city, state, latitude, longitude FROM routers"
+    query = "SELECT router_mac, timestamp, manufacturer, model, user_ppp, location, city, state, latitude, longitude FROM routers"
 
     print("[extrair_routers] Executando query...")
     with conn.cursor() as cur:
@@ -114,9 +122,26 @@ def extrair_routers(conn):
         rows = cur.fetchall()
 
     df = pd.DataFrame(rows)
-    # Ordenar por timestamp (mais recente primeiro) e pegar o primeiro de cada router_mac
-    df_routers_unicos = df.sort_values("timestamp", ascending=False).drop_duplicates("router_mac", keep="first")
-    print(f"[extrair_routers] {len(df_routers_unicos)} roteadores extraídos")
+    print(f"[extrair_routers] {len(df)} linhas brutas")
+
+    # Criar coluna auxiliar: True se location NÃO é null
+    # Ordenar por essa coluna (True primeiro) e depois por timestamp (mais recente)
+    df["tem_location"] = df["location"].notna()
+    df = df.sort_values(by=["tem_location", "timestamp"], ascending=[False, False])
+
+    # Pegar a primeira linha de cada router_mac (prioriza quem tem location)
+    df_routers_unicos = df.drop_duplicates("router_mac", keep="first")
+
+    # Remover coluna auxiliar
+    df_routers_unicos = df_routers_unicos.drop(columns=["tem_location"])
+
+    # Estatísticas
+    com_loc = df_routers_unicos["location"].notna().sum()
+    sem_loc = df_routers_unicos["location"].isna().sum()
+    print(f"[extrair_routers] {len(df_routers_unicos)} roteadores únicos")
+    print(f"[extrair_routers]   Com localização: {com_loc}")
+    print(f"[extrair_routers]   Sem localização: {sem_loc} ({sem_loc/len(df_routers_unicos)*100:.1f}%)")
+
     return df_routers_unicos
 
 
@@ -295,7 +320,27 @@ def main():
                     print(f"[main] ({i+1}/{len(dias)}) {nome_dia} já existe, pulando...")
                     continue
 
-            df_dia = extrair_metrics_dia(conn, dia)
+            # Tenta extrair com reconexão automática (QuestDB cai às vezes)
+            tentativas = 0
+            max_tentativas = 3
+            while tentativas < max_tentativas:
+                try:
+                    df_dia = extrair_metrics_dia(conn, dia)
+                    break  # sucesso, sai do while
+                except Exception as e:
+                    tentativas += 1
+                    print(f"[main] Erro ao extrair {nome_dia} (tentativa {tentativas}/{max_tentativas}): {e}")
+                    if tentativas < max_tentativas:
+                        print(f"[main] Reconectando ao QuestDB...")
+                        try:
+                            conn.close()
+                        except:
+                            pass
+                        time.sleep(5)  # espera 5 segundos antes de reconectar
+                        conn = conectar()
+                    else:
+                        print(f"[main] ❌ Falha após {max_tentativas} tentativas. Pulando {nome_dia}.")
+                        df_dia = pd.DataFrame()  # vazio, vai pular
 
             # Se o dia não tem dados (ex: futuro), pula
             if len(df_dia) == 0:
@@ -330,6 +375,8 @@ def main():
     print("\n[main] Consolidando todas as features...")
     import glob
     arquivos_features = sorted(glob.glob("data/processed/features_*.csv"))
+    # Excluir o arquivo consolidado anterior (se existir) para não duplicar
+    arquivos_features = [f for f in arquivos_features if "todos_dias" not in f]
     if len(arquivos_features) > 0:
         todas_features = pd.concat([pd.read_csv(f) for f in arquivos_features])
         todas_features.to_csv("data/processed/features_todos_dias.csv", index=False)

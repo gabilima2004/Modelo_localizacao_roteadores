@@ -43,73 +43,126 @@ else:
     print(f"[modelo] Lendo features_2026-04-01.csv ({len(df)} linhas)")
 
 # ============================================================
-# AGREGAR: separar dias úteis de fins de semana (2 perfis)
+# AGREGAR: votação por mês (lida com sazonalidade)
 # ============================================================
 # O features_todos_dias.csv tem uma linha por roteador POR DIA.
-# O K-Means precisa de 1 linha por roteador. Mas não podemos simplesmente
-# fazer a média de todos os dias — isso dilui o sinal comercial
-# (uma loja tem tráfego alto em dias úteis e baixo em fds).
+# Descobrimos que 4918 roteadores têm alta variabilidade entre meses
+# (std > 0.1). Fazer a média de todos os meses dilui padrões sazonais
+# (ex: férias em julho, Copa do Mundo).
 #
-# Solução: criar 2 perfis por roteador:
-# - perfil_uteis: média das horas em dias úteis (seg-sex)
-# - perfil_fds: média das horas em fins de semana (sab-dom)
+# Solução: Votação por mês.
+# 1. Para cada mês, agregamos os dias úteis e fds (2 perfis).
+# 2. O K-Means classifica o roteador em cada mês separadamente.
+# 3. A classificação final é a que teve mais votos (a moda).
 #
-# Assim o K-Means vê a diferença de comportamento entre úteis e fds,
-# que é o sinal mais forte para distinguir comercial de residencial.
+# Isso faz com que um mês atípico (férias) não consiga mudar a
+# classificação final sozinho.
 if df.index.duplicated().any():
     print(f"[modelo] Detectadas linhas duplicadas (múltiplos dias por roteador)")
-    print(f"[modelo] Agregando por roteador (2 perfis: úteis vs fds)...")
+    print(f"[modelo] Agregando por mês e aplicando votação...")
 
     colunas_perfil = [f"h_{i}" for i in range(24)]
 
-    # Separar dias úteis de fins de semana
-    if "eh_fds" in df.columns:
-        df_uteis = df[df["eh_fds"] == False].copy()
-        df_fds = df[df["eh_fds"] == True].copy()
-        print(f"[modelo] Dias úteis: {len(df_uteis)} linhas")
-        print(f"[modelo] Fins de semana: {len(df_fds)} linhas")
+    if "mes" not in df.columns:
+        print(f"[modelo] Coluna 'mes' não encontrada — usando agregação simples (média de todos os dias)")
+        # (código antigo de compatibilidade mantido)
+        if "eh_fds" in df.columns:
+            df_uteis = df[df["eh_fds"] == False].copy()
+            df_fds = df[df["eh_fds"] == True].copy()
+            agg_uteis = df_uteis.groupby(df_uteis.index)[colunas_perfil].mean()
+            agg_fds = df_fds.groupby(df_fds.index)[colunas_perfil].mean()
+            agg_uteis.columns = [f"uteis_{c}" for c in agg_uteis.columns]
+            agg_fds.columns = [f"fds_{c}" for c in agg_fds.columns]
+            agregado = agg_uteis.join(agg_fds, how="outer").fillna(0)
+            if "razao_comercial" in df.columns:
+                agregado["razao_comercial"] = df.groupby(df.index)["razao_comercial"].mean()
+            colunas_uteis = [f"uteis_h_{i}" for i in range(24)]
+            if all(c in agregado.columns for c in colunas_uteis):
+                agregado["hora_pico"] = agregado[colunas_uteis].idxmax(axis=1).str.replace("uteis_h_", "").astype(int)
+            df = agregado
+        else:
+            colunas_media = [f"h_{i}" for i in range(24)] + ["razao_comercial"]
+            df = df.groupby(df.index)[[c for c in colunas_media if c in df.columns]].mean()
+        print(f"[modelo] Após agregação: {len(df)} roteadores únicos")
 
-        # Agregar cada grupo por roteador (média do perfil horário)
-        agg_uteis = df_uteis.groupby(df_uteis.index)[colunas_perfil].mean()
-        agg_fds = df_fds.groupby(df_fds.index)[colunas_perfil].mean()
+    else:
+        # --- NOVA LÓGICA: VOTAÇÃO POR MÊS ---
+        meses = sorted(df["mes"].unique())
+        print(f"[modelo] Meses encontrados: {meses}")
 
-        # Renomear colunas: h_0 → uteis_h_0, h_0 → fds_h_0
+        # Guardar a classificação de cada roteador em cada mês
+        votos_por_router = {}
+
+        for mes in meses:
+            df_mes = df[df["mes"] == mes].copy()
+
+            # Agregar úteis e fds dentro do mês
+            df_uteis = df_mes[df_mes["eh_fds"] == False]
+            df_fds = df_mes[df_mes["eh_fds"] == True]
+
+            agg_uteis = df_uteis.groupby(df_uteis.index)[colunas_perfil].mean()
+            agg_fds = df_fds.groupby(df_fds.index)[colunas_perfil].mean()
+            agg_uteis.columns = [f"uteis_{c}" for c in agg_uteis.columns]
+            agg_fds.columns = [f"fds_{c}" for c in agg_fds.columns]
+
+            perfil_mes = agg_uteis.join(agg_fds, how="outer").fillna(0)
+
+            # Normalizar L1
+            soma = perfil_mes.sum(axis=1)
+            perfil_norm = perfil_mes.div(soma, axis=0)
+
+            # Rodar K-Means para este mês
+            kmeans = KMeans(n_clusters=2, random_state=42, n_init=10)
+            grupos = kmeans.fit_predict(perfil_norm)
+
+            # Interpretar grupos (qual é comercial?)
+            razao_mes = df_mes.groupby(df_mes.index)["razao_comercial"].mean()
+            perfil_mes["razao_comercial"] = razao_mes
+            perfil_mes["grupo"] = grupos
+
+            razao_por_grupo = perfil_mes.groupby("grupo")["razao_comercial"].mean()
+            grupo_comercial = razao_por_grupo.idxmax()
+            grupo_residencial = razao_por_grupo.idxmin()
+
+            # Mapear e guardar o voto
+            for mac, row in perfil_mes.iterrows():
+                if mac not in votos_por_router:
+                    votos_por_router[mac] = []
+                if row["grupo"] == grupo_comercial:
+                    votos_por_router[mac].append("comercial")
+                else:
+                    votos_por_router[mac].append("residencial")
+
+        # Contar votos e definir classificação final (moda)
+        classificacao_final = {}
+        for mac, votos in votos_por_router.items():
+            # Pega o voto mais frequente
+            classificacao_final[mac] = max(set(votos), key=votos.count)
+
+        # Criar DataFrame final com a classificação votada
+        df_final = pd.DataFrame.from_dict(classificacao_final, orient="index", columns=["classificacao_kmeans"])
+        df_final.index.name = "router_mac"
+
+        # Adicionar razao_comercial média (para a regra)
+        if "razao_comercial" in df.columns:
+            df_final["razao_comercial"] = df.groupby(df.index)["razao_comercial"].mean()
+
+        # Adicionar perfis médios (para visualização)
+        agg_uteis = df[df["eh_fds"] == False].groupby(level=0)[colunas_perfil].mean()
+        agg_fds = df[df["eh_fds"] == True].groupby(level=0)[colunas_perfil].mean()
         agg_uteis.columns = [f"uteis_{c}" for c in agg_uteis.columns]
         agg_fds.columns = [f"fds_{c}" for c in agg_fds.columns]
+        perfis_medios = agg_uteis.join(agg_fds, how="outer").fillna(0)
+        df_final = df_final.join(perfis_medios)
 
-        # Juntar os 2 perfis (outer join mantém roteadores que só têm um tipo)
-        agregado = agg_uteis.join(agg_fds, how="outer")
-
-        # Preencher NaN com 0 (roteadores sem dados de fds, por exemplo)
-        agregado = agregado.fillna(0)
-
-        # Calcular razao_comercial média (de todos os dias)
-        if "razao_comercial" in df.columns:
-            razao_media = df.groupby(df.index)["razao_comercial"].mean()
-            agregado["razao_comercial"] = razao_media
-
-        # Recalcular hora_pico a partir do perfil de dias úteis
+        # Hora de pico
         colunas_uteis = [f"uteis_h_{i}" for i in range(24)]
-        if all(c in agregado.columns for c in colunas_uteis):
-            agregado["hora_pico"] = (
-                agregado[colunas_uteis].idxmax(axis=1)
-                .str.replace("uteis_h_", "")
-                .astype(int)
-            )
+        if all(c in df_final.columns for c in colunas_uteis):
+            df_final["hora_pico"] = df_final[colunas_uteis].idxmax(axis=1).str.replace("uteis_h_", "").astype(int)
 
-        df = agregado
-        print(f"[modelo] Após agregação: {len(df)} roteadores únicos")
-        print(f"[modelo] Features: {len(df.columns)} colunas (2 perfis × 24 horas + extras)")
-    else:
-        # Se não tem a coluna eh_fds, faz agregação simples (compatibilidade)
-        print(f"[modelo] Sem coluna eh_fds — agregação simples (média de todos os dias)")
-        colunas_media = [f"h_{i}" for i in range(24)] + ["razao_comercial"]
-        agregado = df.groupby(df.index)[[c for c in colunas_media if c in df.columns]].mean()
-        colunas_perfil = [f"h_{i}" for i in range(24)]
-        if all(c in agregado.columns for c in colunas_perfil):
-            agregado["hora_pico"] = agregado[colunas_perfil].idxmax(axis=1).str.replace("h_", "").astype(int)
-        df = agregado
-        print(f"[modelo] Após agregação: {len(df)} roteadores únicos")
+        df = df_final
+        print(f"[modelo] Após votação: {len(df)} roteadores únicos")
+        print(f"[modelo] Features: {len(df.columns)} colunas")
 
 # ============================================================
 # FUNÇÃO 1: Regra de negócio (baseline)
@@ -376,9 +429,11 @@ def main():
     # Perfil com pico: std alto (umas horas muito maiores que outras)
     std_perfil = perfil_normalizado.std(axis=1)
 
-    # Threshold: perfis com std muito baixo são planos (anômalos)
-    # Usamos o 1º percentil — os 1% mais planos são outliers
-    threshold = std_perfil.quantile(0.01)
+    # Threshold: valor fixo baseado na análise dos dados.
+    # O std médio dos perfis normais é ~0.035. Perfis planos (anômalos) têm std < 0.01.
+    # Um valor de 0.01 significa que o tráfego varia muito pouco entre as horas
+    # (menos de 1% de variação), indicando ausência de pico.
+    threshold = 0.01
     mascara_outlier = std_perfil < threshold
     mascara_normal = ~mascara_outlier
 
@@ -402,29 +457,28 @@ def main():
     print("=" * 60)
     classificacao_regra = classificar_regra(df)
 
-    # 2. K-Means
+    # 2. K-Means (JÁ CALCULADO PELA VOTAÇÃO POR MÊS)
     print("\n" + "=" * 60)
-    print("  ABORDAGEM 2: K-MEANS (clustering)")
+    print("  ABORDAGEM 2: K-MEANS (Votação por mês)")
     print("=" * 60)
-    grupos_kmeans = classificar_kmeans(df, k=2)
+    # A coluna 'classificacao_kmeans' já foi preenchida pela votação no início do arquivo
+    classificacao_kmeans = df["classificacao_kmeans"].copy()
+    print(f"[kmeans] Total: {len(classificacao_kmeans)} roteadores")
+    print(f"[kmeans] Comercial: {(classificacao_kmeans == 'comercial').sum()}")
+    print(f"[kmeans] Residencial: {(classificacao_kmeans == 'residencial').sum()}")
 
-    # 3. Interpretar grupos
-    print("\n" + "=" * 60)
-    print("  INTERPRETAÇÃO DOS GRUPOS")
-    print("=" * 60)
-    classificacao_kmeans = interpretar_grupos(df, grupos_kmeans)
-
-    # 4. Comparar métodos
+    # 3. Comparar métodos
     print("\n" + "=" * 60)
     print("  COMPARAÇÃO: REGRA vs K-MEANS")
     print("=" * 60)
     comparacao = comparar_metodos(classificacao_regra, classificacao_kmeans)
 
-    # 5. Analisar perfil horário
+    # 4. Analisar perfil horário
     print("\n" + "=" * 60)
     print("  PERFIL HORÁRIO POR GRUPO")
     print("=" * 60)
-    analisar_perfil_grupos(df, grupos_kmeans)
+    # Usar a classificação final como grupo para plotar o perfil
+    analisar_perfil_grupos(df, classificacao_kmeans)
 
     # 6. Salvar resultado final
     print("\n" + "=" * 60)

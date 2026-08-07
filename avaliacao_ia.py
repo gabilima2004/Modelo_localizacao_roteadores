@@ -73,12 +73,15 @@ def amostra_manual(df, n=10):
     - Roteador "comercial" deveria estar em zona comercial
     - Roteador "residencial" deveria estar em zona residencial
     """
+    # Filtrar só roteadores que TÊM endereço (location não nulo)
+    df_com_endereco = df.dropna(subset=["location"])
+
     print(f"\n{'='*60}")
     print("  AMOSTRA MANUAL — COMERCIAL")
     print(f"{'='*60}")
 
     # Pegar n roteadores classificados como comercial (pelo K-Means)
-    comerciais = df[df["classificacao_kmeans"] == "comercial"]
+    comerciais = df_com_endereco[df_com_endereco["classificacao_kmeans"] == "comercial"]
     if len(comerciais) > 0:
         amostra = comerciais.sample(min(n, len(comerciais)))
         for mac, row in amostra.iterrows():
@@ -91,14 +94,14 @@ def amostra_manual(df, n=10):
             print(f"    Razão comercial: {razao:.4f}")
             print()
     else:
-        print("  Nenhum roteador comercial encontrado")
+        print("  Nenhum roteador comercial com endereço encontrado")
 
     print(f"\n{'='*60}")
     print("  AMOSTRA MANUAL — RESIDENCIAL")
     print(f"{'='*60}")
 
     # Pegar n roteadores classificados como residencial
-    residenciais = df[df["classificacao_kmeans"] == "residencial"]
+    residenciais = df_com_endereco[df_com_endereco["classificacao_kmeans"] == "residencial"]
     if len(residenciais) > 0:
         amostra = residenciais.sample(min(n, len(residenciais)))
         for mac, row in amostra.iterrows():
@@ -111,7 +114,7 @@ def amostra_manual(df, n=10):
             print(f"    Razão comercial: {razao:.4f}")
             print()
     else:
-        print("  Nenhum roteador residencial encontrado")
+        print("  Nenhum roteador residencial com endereço encontrado")
 
 
 # ============================================================

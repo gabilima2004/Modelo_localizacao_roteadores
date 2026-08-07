@@ -78,35 +78,57 @@ def calcular_deltas(df_metrics):
 # FUNÇÃO 2: Tráfego por roteador por hora
 # ============================================================
 def trafego_por_hora(df_metrics):
-    """Agrupa os deltas por roteador + hora e soma."""
-    trafego = df_metrics.groupby(["router_mac", "hora"])[["delta_bytes_up", "delta_bytes_down"]].sum()
-    print(f"[trafego_por_hora] {len(trafego)} linhas (roteador × hora)")
+    """Agrupa os deltas por roteador + hora e soma.
+
+    Mantém a coluna 'eh_fds' para que as funções de tráfego
+    comercial e residencial possam filtrar só dias úteis.
+    """
+    # Agrupar por roteador + hora + eh_fds (para manter a info)
+    trafego = df_metrics.groupby(["router_mac", "hora", "eh_fds"])[["delta_bytes_up", "delta_bytes_down"]].sum()
+    print(f"[trafego_por_hora] {len(trafego)} linhas (roteador × hora × tipo_dia)")
     return trafego
 
 
 # ============================================================
-# FUNÇÃO 3: Tráfego comercial (8h-17h)
+# FUNÇÃO 3: Tráfego comercial (8h-17h) — SÓ em dias úteis
 # ============================================================
-def trafego_comercial(trafego):
-    """Soma o tráfego das horas comerciais (8h-17h) para cada roteador."""
+def trafego_comercial(trafego, eh_fds=False):
+    """Soma o tráfego das horas comerciais (8h-17h) para cada roteador.
+
+    IMPORTANTE: só considera dias úteis (eh_fds=False).
+    Fins de semana e feriados têm comportamento diferente (comércio fecha)
+    e não devem entrar no cálculo do tráfego comercial.
+    """
     trafego_reset = trafego.reset_index()
-    comercial = trafego_reset[trafego_reset["hora"].isin(range(8, 18))]
+
+    # Filtrar só dias úteis (eh_fds=False) E horas comerciais (8-17)
+    comercial = trafego_reset[
+        (trafego_reset["eh_fds"] == False) &
+        (trafego_reset["hora"].isin(range(8, 18)))
+    ]
     comercial = comercial.groupby("router_mac")[["delta_bytes_up", "delta_bytes_down"]].sum()
-    print(f"[trafego_comercial] {len(comercial)} roteadores")
+    print(f"[trafego_comercial] {len(comercial)} roteadores (só dias úteis)")
     return comercial
 
 
 # ============================================================
-# FUNÇÃO 4: Tráfego residencial (18h-7h)
+# FUNÇÃO 4: Tráfego residencial (18h-7h) — SÓ em dias úteis
 # ============================================================
-def trafego_residencial(trafego):
-    """Soma o tráfego das horas residenciais (18h-7h) para cada roteador."""
+def trafego_residencial(trafego, eh_fds=False):
+    """Soma o tráfego das horas residenciais (18h-7h) para cada roteador.
+
+    IMPORTANTE: só considera dias úteis (eh_fds=False).
+    A razão comercial compara o comportamento DURANTE a semana.
+    """
     trafego_reset = trafego.reset_index()
+
+    # Filtrar só dias úteis (eh_fds=False) E horas residenciais (18-7)
     residencial = trafego_reset[
-        (trafego_reset["hora"] >= 18) | (trafego_reset["hora"] < 8)
+        (trafego_reset["eh_fds"] == False) &
+        ((trafego_reset["hora"] >= 18) | (trafego_reset["hora"] < 8))
     ]
     residencial = residencial.groupby("router_mac")[["delta_bytes_up", "delta_bytes_down"]].sum()
-    print(f"[trafego_residencial] {len(residencial)} roteadores")
+    print(f"[trafego_residencial] {len(residencial)} roteadores (só dias úteis)")
     return residencial
 
 
@@ -209,20 +231,24 @@ def processar_dia(caminho_csv):
     df_metrics = pd.read_csv(caminho_csv, parse_dates=["timestamp"])
     print(f"→ Carregado: {len(df_metrics)} linhas")
 
+    # Adicionar coluna eh_fds no df_metrics (antes de calcular_deltas)
+    # para que trafego_por_hora possa agrupar por tipo de dia
+    df_metrics["eh_fds"] = eh_fds
+
     # 1. Calcular deltas
     print("\n→ Passo 1: Calculando deltas...")
     df_metrics = calcular_deltas(df_metrics)
 
-    # 2. Agrupar por roteador + hora
+    # 2. Agrupar por roteador + hora + tipo de dia
     print("\n→ Passo 2: Agrupando por roteador + hora...")
     trafego = trafego_por_hora(df_metrics)
 
-    # 3. Calcular tráfego comercial
-    print("\n→ Passo 3: Calculando tráfego comercial (8h-17h)...")
+    # 3. Calcular tráfego comercial (só dias úteis)
+    print("\n→ Passo 3: Calculando tráfego comercial (8h-17h, só dias úteis)...")
     comercial = trafego_comercial(trafego)
 
-    # 4. Calcular tráfego residencial
-    print("\n→ Passo 4: Calculando tráfego residencial (18h-7h)...")
+    # 4. Calcular tráfego residencial (só dias úteis)
+    print("\n→ Passo 4: Calculando tráfego residencial (18h-7h, só dias úteis)...")
     residencial = trafego_residencial(trafego)
 
     # 5. Calcular razão comercial
@@ -250,7 +276,9 @@ def processar_dia(caminho_csv):
     # Adicionar colunas de data e dia da semana
     tabela["data"] = data_str
     tabela["dia_semana"] = dia_semana  # 0=segunda, 6=domingo
-    tabela["eh_fds"] = eh_fds           # True se sábado ou domingo
+    tabela["eh_fds"] = eh_fds           # True se sábado, domingo ou feriado
+    tabela["eh_feriado"] = eh_feriado   # True se feriado (nacional ou estadual)
+    tabela["mes"] = data.month          # 1-12 (para análise sazonal)
 
     # 9. Filtrar roteadores com dados insuficientes
     print("\n→ Passo 9: Filtrando roteadores com dados insuficientes...")
