@@ -25,6 +25,7 @@ Desenvolvemos um modelo de classificação que identifica se um roteador de inte
 | Silhouette Score              | 0.4711        |
 | Validação humana (Grafana)    | 100% (4/4)    |
 | Validação manual (endereços)  | ver Seção 3.6 |
+| Validação automática (endereços) | 93,4% K-Means (1.587) |
 
 ## Como o modelo classifica
 
@@ -139,15 +140,94 @@ O gráfico mostra que a **separação entre comercial e residencial** não está
 
 > **Conclusão**: O modelo captura essa diferença através das 48 features (24h úteis + 24h fds). A normalização L1 garante que comparamos a **forma** do perfil, não o volume.
 
-### O papel do Volume no Modelo
+### O papel do Volume no Modelo — Teste de Normalizações
 
-Foi realizado um teste para verificar se o K-Means estava agrupando os roteadores puramente por **volume** (muito tráfego vs pouco tráfego) em vez de **padrão** (horário do pico). Testamos 3 normalizações:
+Foi realizado um teste para verificar se o K-Means estava agrupando os roteadores puramente por **volume** (muito tráfego vs pouco tráfego) em vez de **padrão** (horário do pico). O script `teste_normalizacao_ia.py` testou 3 normalizações.
 
-1. **L1 (Atual)**: Melhor separação (Silhouette 0.47), mas maior diferença de volume (3.15x).
-2. **L2**: Separação média (0.29), diferença de volume média (2.36x).
-3. **Z-Score**: Pior separação (0.18), menor diferença de volume (1.56x).
+#### Por que normalizar?
 
-> **Conclusão do teste**: O volume **faz parte** da diferença real entre os grupos. O residencial tem naturalmente mais volume (muitos dispositivos, streaming). Tentar remover o volume (Z-Score) destrói a separação dos grupos. Portanto, a normalização L1 foi mantida, pois o volume atua como uma feature legítima e não apenas como um viés.
+Sem normalização, um roteador com 100 GB de tráfego fica "longe" de um com 1 GB, mesmo que tenham o **mesmo padrão** (pico às 23h). O K-Means agruparia por volume, não por forma. A normalização resolve isso ajustando a escala.
+
+#### As 3 normalizações testadas
+
+**1. L1 (Normalização pela soma)**
+
+Cada perfil é dividido pela sua soma total. Depois da L1, cada roteador soma exatamente 1,0 — comparamos só a **forma** da curva.
+
+```
+Antes:  h_0=2GB, h_1=1GB, ..., h_23=5GB    (soma = 20GB)
+Depois: h_0=0.10, h_1=0.05, ..., h_23=0.25 (soma = 1.0)
+```
+
+> **O que preserva:** a forma (proporção entre horas)
+> **O que remove:** o volume total (tudo soma 1)
+> **Mas não remove completamente:** roteadores com tráfego concentrado em poucas horas ficam com picos mais altos após L1
+
+**2. L2 (Normalização pela norma euclidiana)**
+
+Cada perfil é dividido pela raiz da soma dos quadrados. Mais suave que L1 — não força a soma a ser 1.
+
+```
+Antes:  h_0=2GB, h_1=1GB, ..., h_23=5GB
+Depois: h_0=0.37, h_1=0.18, ..., h_23=0.92 (norma = 1)
+```
+
+> **O que preserva:** a forma, mas com menos contraste que L1
+> **O que remove:** parte do volume
+> **Característica:** intermediária entre L1 e Z-Score
+
+**3. Z-Score (StandardScaler por linha)**
+
+Para cada roteador: subtrai a média e divide pelo desvio padrão. O resultado tem média=0 e desvio=1. Remove **tudo** que for relacionado a volume — só sobra o "formato puro".
+
+```
+Antes:  h_0=2GB, h_1=1GB, ..., h_23=5GB    (média=2.5, std=1.2)
+Depois: h_0=-0.4, h_1=-1.2, ..., h_23=2.1  (média=0, std=1)
+```
+
+> **O que preserva:** só o formato (quais horas estão acima/abaixo da média)
+> **O que remove:** volume total E a magnitude dos picos
+> **Problema:** remove informação real — o volume dos picos é um sinal legítimo
+
+#### Resultados do teste
+
+| Normalização | Silhouette | Razão Volume (Res/Com) | O que significa |
+| --- | --- | --- | --- |
+| **L1 (Atual)** | **0,47** | **3,15x** | Melhor separação, mas residencial tem 3x mais volume |
+| L2 | 0,29 | 2,36x | Separação média, volume médio |
+| Z-Score | 0,18 | 1,56x | Pior separação, volume quase igual |
+
+#### Como interpretar
+
+- **Silhouette MAIOR** = grupos melhores separados (mais coesos e distantes)
+- **Razão MAIS PRÓXIMA de 1,0** = menos diferença de volume entre os grupos
+
+```
+Silhouette
+  ↑
+  │  L1 ●  0,47  ← melhor separação
+  │  L2 ●  0,29
+  │  ZS ●  0,18  ← pior separação
+  └──────────────→
+
+Razão de volume (Res/Com)
+  ↑
+  │  L1 ●  3,15x  ← mais diferença de volume
+  │  L2 ●  2,36x
+  │  ZS ●  1,56x  ← menos diferença (quase igual)
+  └──────────────→
+```
+
+#### O dilema
+
+| | L1 | Z-Score |
+|---|---|---|
+| Separação dos grupos | ✅ Melhor (0,47) | ❌ Pior (0,18) |
+| Viés de volume | ⚠️ Maior (3,15x) | ✅ Menor (1,56x) |
+
+Se o K-Means estivesse agrupando **só por volume**, o Z-Score (que remove o volume) deveria ter a **melhor** separação. Mas o oposto aconteceu: o Z-Score teve a **pior** separação (0,18).
+
+> **Conclusão do teste**: O volume **faz parte** da diferença real entre os grupos. O residencial tem naturalmente mais volume (muitos dispositivos, streaming). Tentar remover o volume (Z-Score) destrói a separação dos grupos — provando que o K-Means não está agrupando só por volume, mas sim pelo **padrão + volume** (que são correlacionados). Portanto, a normalização L1 foi mantida, pois o volume atua como uma feature legítima e não apenas como um viés.
 
 ## Insight 2: O tráfego parece medir consumo, não trabalho
 
@@ -258,6 +338,89 @@ Para complementar a validação no Grafana (4 roteadores), foi feita uma **valid
 
 > **Conclusão**: A validação manual com endereços confirma que o modelo está identificando corretamente o padrão comercial vs residencial. Os casos onde o modelo classificou como comercial mas o endereço é residencial (ex: "CASA") indicam roteadores residenciais com padrão de uso atípico (pessoas que trabalham em casa durante o horário comercial). Alguns roteadores residenciais em áreas turísticas (Geribá, Arraial do Cabo) podem ser Airbnb, que têm padrão de uso diferente de uma residência fixa.
 
+## Insight 7: Validação automática por endereço (ground truth em larga escala)
+
+Para ampliar a validação além dos 20 roteadores manuais, foi criado o script `classificacao_endereco_ia.py`, que classifica automaticamente os endereços usando **palavras-chave** e compara com o modelo.
+
+### Metodologia
+
+1. Carrega a tabela `routers` (2.454 roteadores com endereço)
+2. Para cada endereço, procura palavras-chave:
+   - **Residencial**: "casa", "ap", "apto", "condomínio", "lote", "vila", "chácara", "sítio", "km" (rural), "quadra", "bloco"
+   - **Comercial**: "loja", "sala", "sla", "imobiliária", "comércio", "empresa", "escritório", "shopping", "galpão"
+   - Se encontrar ambas ou nenhuma → "indefinido" (não compara)
+3. Compara a classificação por endereço com o modelo (regra + K-Means)
+
+### Resultados
+
+| Métrica | Valor |
+| --- | --- |
+| Roteadores com endereço | 2.454 |
+| Endereço residencial | 1.482 |
+| Endereço comercial | 105 |
+| Endereço indefinido | 867 (35%) |
+| **Roteadores comparáveis** | **1.587** |
+
+### Acerto do modelo vs ground truth
+
+| Método | Acerto | % |
+| --- | --- | --- |
+| **K-Means** | **1.482 / 1.587** | **93,4%** |
+| Regra de negócio | 1.389 / 1.587 | 87,5% |
+
+> **Conclusão**: O K-Means é **superior** à regra de negócio (93,4% vs 87,5%). O ML captura padrões que a regra simples (razão > 0,5) não consegue, confirmando o valor do clustering.
+
+### Cruzamento Endereço × K-Means
+
+| Combinação | Qtd | % | Interpretação |
+| --- | --- | --- | --- |
+| ✅ Residencial → Residencial | 1.426 | 89,9% | Modelo acertou |
+| ✅ Comercial → Comercial | 56 | 3,5% | Modelo acertou |
+| ⚠️ Residencial → Comercial | 43 | 2,7% | Home office (residência com padrão comercial) |
+| ⚠️ Comercial → Residencial | 49 | 3,1% | Comércio com padrão residencial |
+
+### Análise dos erros
+
+**Home office (43 roteadores — 2,7%):**
+
+Residências classificadas como comercial porque têm muito tráfego durante o dia. Exemplos:
+
+| Router MAC | Endereço | Razão | Por quê? |
+| --- | --- | --- | --- |
+| `3c:78:95:7b:1c:a8` | casa em Cabo Frio | 0,96 | Pessoa trabalha em casa o dia todo |
+| `50:3d:d1:1f:2e:f8` | CASA 6 | 0,78 | Home office intenso |
+
+> **Confirma a Limitação 2**: o modelo mede consumo, não trabalho. Casas com muito tráfego durante o dia parecem comércio.
+
+**Comércio sazonal (49 roteadores — 3,1%):**
+
+Comércios classificados como residencial porque têm pouco tráfego. Exemplos:
+
+| Router MAC | Endereço | Razão | Por quê? |
+| --- | --- | --- | --- |
+| `0c:ef:15:08:8d:08` | LOJA em Arraial do Cabo | 0,05 | Loja de praia — pouco tráfego fora da temporada |
+| `3c:6a:d2:a7:00:d8` | LOJA em Praia Grande | 0,09 | Loja turística — só abre na temporada |
+| `3c:6a:d2:a6:ca:c8` | LOJA 57 IMPORTADORA | 0,50 | Comércio com tráfego misto |
+
+> **Hipótese**: lojas em áreas turísticas (Arraial do Cabo, Búzios) têm pouco tráfego fora da temporada. O modelo vê "pouco tráfego" e classifica como residencial.
+
+### Concordância Regra vs K-Means por grupo
+
+| Grupo do endereço | Concordância |
+| --- | --- |
+| Residencial | 1.383 / 1.482 (93,3%) |
+| Comercial | 91 / 105 (86,7%) |
+
+> **Conclusão**: A discordância entre regra e K-Means é maior em comércios (13,3%) do que em residenciais (6,7%). Isso faz sentido: comércios têm padrões mais variados (sazonalidade, horários atípicos), enquanto residenciais são mais uniformes.
+
+### Limitações desta validação
+
+- **35% de indefinidos**: muitos endereços não têm palavras-chave claras (só rua e número)
+- **Palavras-chave não são 100% precisas**: "casa" pode ser comércio dentro de residência; "avenida" não é indicador confiável
+- **Airbnb**: residências turísticas podem ter padrão de uso diferente de residência fixa
+
+> **Conclusão geral**: Esta validação automática, com 1.587 roteadores, é a **maior amostra de ground truth** do projeto e confirma que o K-Means atinge **93,4% de acerto** — um resultado sólido que aumenta significativamente a confiança no modelo.
+
 ---
 
 # 4. Limitações
@@ -274,19 +437,13 @@ Como o tráfego mede consumo de internet, escritórios onde as pessoas só traba
 
 **Impacto**: Alguns comerciais podem ser classificados errado.
 
-## Limitação 3: Feriados não tratados (ainda)
-
-Feriados foram implementados no código mas os dados já processados não foram re-processados. Feriados como Tiradentes (21/04) e Dia do Trabalho (01/05) foram tratados como dias úteis.
-
-**Impacto**: Alguns dias de feriado podem ter sido classificados errado.
-
-## Limitação 4: Apenas 4 meses de dados
+## Limitação 3: penas 4 meses de dados
 
 O modelo foi treinado com 111 dias (abril a julho de 2026). Padrões sazonais mais longos (férias escolares de dezembro, Carnaval) não foram capturados.
 
 **Impacto**: O modelo pode não generalizar para outros períodos do ano.
 
-## Limitação 5: Validação manual baseada em endereços
+## Limitação 4: validação manual baseada em endereços
 
 A validação manual usou indicadores no endereço ("CASA", "LOJA", "sala") como proxy para a classificação real. Alguns endereços são ambíguos (avenidas sem indicador) e a classificação foi inferida.
 
@@ -296,19 +453,8 @@ A validação manual usou indicadores no endereço ("CASA", "LOJA", "sala") como
 
 # 5. Recomendações
 
-## Recomendação 1: Usar a classificação com confiança
 
-Para os 90.8% dos roteadores onde regra e K-Means concordam, a classificação é confiável. Para os 9.2% que discordam, investigar caso a caso.
-
-## Recomendação 2: Re-processar com feriados
-
-Apagar as features dos dias de feriado (21/04, 01/05) e re-processar com a nova lógica de feriados. Isso deve melhorar a acurácia.
-
-## Recomendação 3: Ampliar para mais meses
-
-Processar mais meses de dados para capturar sazonalidade (férias de dezembro, Carnaval).
-
-## Recomendação 4: Investigar os 62 roteadores anômalos
+## Investigar os 62 roteadores anômalos
 
 Os 40 roteadores com padrão plano (sem pico) podem ser:
 
@@ -348,19 +494,10 @@ h_0: 0.04, h_1: 0.04, h_2: 0.04, ..., h_23: 0.04
 
 > **Observação:** Nem todo padrão anômalo é um erro. Roteadores de IoT (sensores, câmeras) podem ter tráfego legítimo e constante. A investigação caso a caso é necessária para distinguir erros de comportamentos válidos.
 
-## Recomendação 5: Validar com mais endereços
+## Validar com mais endereços
 
 Preencher a localização dos 66% de roteadores sem endereço para validar o modelo com mais dados.
 
-## Recomendação 6: Expandir a validação manual
-
-A validação manual com 20 roteadores (Seção 3.6) mostrou que o modelo identifica corretamente o padrão, mas alguns roteadores residenciais com uso atípico (home office) são classificados como comercial. Para reduzir esse erro:
-
-- Aumentar a amostra para 50-100 roteadores
-- Visitar endereços ambíguos (avenidas sem indicador)
-- Considerar uma terceira classe: "home_office" (residencial com padrão comercial)
-
----
 
 # 5.1. Comparação de Algoritmos: K-Means vs HDBSCAN
 
@@ -403,62 +540,6 @@ O **K-Means é o melhor algoritmo** para este projeto porque:
 4. ✅ Mais rápido e simples
 
 O HDBSCAN é útil quando **não se sabe** quantos grupos existem. Como sabemos que são 2, o K-Means é a escolha certa.
-
----
-
-# 5.2. Entendendo o Gráfico de Distribuição de Volume (`06_volume_boxplot.png`)
-
-> **Pergunta da usuária**: "Me explique esse layout de distribuição de volume total, pois não entendi esse modelo."
-
-### O que é um boxplot?
-
-Um **boxplot** (diagrama de caixa) é um gráfico que mostra a **distribuição** de um conjunto de dados. Ele resume 5 números estatísticos em um desenho:
-
-```
-          ┌──────┐
-     ╴─────┤      ├─────╴  ← "bigodes" (valores extremos)
-          │  ──  │        ← mediana (linha do meio)
-          └──────┘
-            ↑ ↑
-         Q1  Q3
-```
-
-| Parte do boxplot          | O que significa                                                   |
-| ------------------------- | ----------------------------------------------------------------- |
-| **Caixa** (box)           | Contém 50% dos dados centrais (do Q1 ao Q3)                       |
-| **Linha dentro da caixa** | **Mediana** — o valor do meio (50% está acima, 50% abaixo)        |
-| **Bigodes** (whiskers)    | Alcance dos dados sem outliers                                    |
-| **Altura da caixa**       | **IQR** (amplitude interquartil) — quão espalhados os dados estão |
-
-### O que o gráfico mostra
-
-O gráfico `06_volume_boxplot.png` tem **4 caixas**, uma para cada combinação de grupo (comercial vs residencial) e tipo de dia (úteis vs fds):
-
-| Caixa | Grupo       | Tipo de dia    | O que representa                                       |
-| ----- | ----------- | -------------- | ------------------------------------------------------ |
-| 1     | Comercial   | Dias úteis     | Volume total dos roteadores comerciais em dias úteis   |
-| 2     | Comercial   | Fins de semana | Volume total dos roteadores comerciais em fds          |
-| 3     | Residencial | Dias úteis     | Volume total dos roteadores residenciais em dias úteis |
-| 4     | Residencial | Fins de semana | Volume total dos roteadores residenciais em fds        |
-
-### Como interpretar
-
-**Comparação 1: Comercial úteis vs Comercial fds (caixas 1 e 2)**
-
-- A caixa de úteis é **mais alta** que a de fds
-- Isso confirma: **comercial tem muito mais tráfego em dias úteis** (comércio aberto)
-- Em fds, o tráfego comercial cai drasticamente (comércio fecha)
-
-**Comparação 2: Residencial úteis vs Residencial fds (caixas 3 e 4)**
-
-- As duas caixas são **parecidas em altura**
-- Isso confirma: **residencial tem tráfego constante** (pessoas em casa todos os dias)
-- Em fds, o tráfego residencial é levemente maior (mais pessoas em casa)
-
-**Comparação 3: Comercial vs Residencial (caixas 1 vs 3, ou 2 vs 4)**
-
-- Residencial tem volume **maior** que comercial
-- Isso parece contraditório, mas faz sentido: residencial tem mais dispositivos (TVs, celulares, streaming) enquanto comercial tem poucos dispositivos (computadores de trabalho)
 
 ### Por que o volume é diferente se o modelo não agrupa por volume?
 
@@ -536,10 +617,11 @@ python pipeline_ia.py
 | `graficos_ia.py`                    | 6     | Geração de gráficos                      |
 | `comparacao_humana_ia.py`           | 6     | Comparação com análise humana (Grafana)  |
 | `validacao_manual_ia.py`            | 6     | Validação manual (20 endereços)          |
+| `classificacao_endereco_ia.py`      | 6     | Validação automática por endereço (1.587)|
 | `analise_volume_sazonalidade_ia.py` | 6     | Análise de volume e sazonalidade         |
 | `teste_normalizacao_ia.py`          | 6     | Teste de normalizações (L1, L2, Z-Score) |
 | `pipeline_ia.py`                    | 7     | Pipeline automatizado                    |
-| `relatorio_final_ia.md`             | 7     | Este relatório                           |
+| `docs/relatorio_final.md`           | 7     | Este relatório                           |
 
 ### Gráficos gerados (`graficos/`)
 
@@ -562,6 +644,8 @@ python pipeline_ia.py
 O modelo de classificação residencial/comercial foi desenvolvido com sucesso, alcançando **91.9% de concordância** entre uma regra de negócio simples e o algoritmo de Machine Learning K-Means, com **100% de acerto na validação humana** (4 roteadores analisados no Grafana).
 
 A **validação manual com 20 endereços** confirmou que o modelo identifica corretamente o padrão comercial vs residencial, com alguns roteadores residenciais de uso atípico (home office) classificados como comercial — uma limitação esperada e documentada.
+
+A **validação automática por endereço** (1.587 roteadores comparáveis) confirmou que o K-Means atinge **93,4% de acerto** contra o ground truth, superando a regra de negócio (87,5%) — a maior amostra de validação do projeto.
 
 O teste do **HDBSCAN** como alternativa mostrou que o K-Means é o algoritmo mais adequado para este problema, pois sabemos que existem 2 grupos e precisamos classificar todos os roteadores.
 

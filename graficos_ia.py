@@ -14,6 +14,7 @@ Gráficos gerados:
   8. Comercial vs residencial por cidade (barras empilhadas)
   9. Silhouette Score por K (cotovelo) — sugestão extra
   10. Histograma da razão comercial — sugestão extra
+  11. Validação por endereço — concordância vs discordância (K-Means e Regra vs Endereço)
 
 IMPORTANTE: este arquivo foi gerado por IA (GitHub Copilot).
 ============================================================
@@ -230,15 +231,15 @@ def grafico_volume_por_hora():
 
 
 # ============================================================
-# GRÁFICO 6: Volume total — úteis vs fds (boxplot)
+# GRÁFICO 6: Volume total — úteis vs fds (barras simples)
 # ============================================================
 def grafico_volume_total_boxplot():
-    """Boxplot do volume total: comercial vs residencial, úteis vs fds.
+    """Barras simples do volume médio: comercial vs residencial, úteis vs fds.
 
-    Boxplot mostra mediana, quartis e outliers — muito mais
-    informativo que histograma para comparar distribuições.
+    Mostra a média de volume total com barras simples e legíveis,
+    em vez do boxplot que era difícil de interpretar.
     """
-    print("\n→ Gráfico 6: Volume total (boxplot: comercial vs residencial)")
+    print("\n→ Gráfico 6: Volume total (barras: comercial vs residencial)")
 
     colunas_uteis = [f"uteis_h_{i}" for i in range(24)]
     colunas_fds = [f"fds_h_{i}" for i in range(24)]
@@ -250,26 +251,43 @@ def grafico_volume_total_boxplot():
     comerciais = df[df["classificacao_kmeans"] == "comercial"]
     residenciais = df[df["classificacao_kmeans"] == "residencial"]
 
-    # Volume total por roteador (em GB)
-    dados = [
-        comerciais[colunas_uteis].sum(axis=1) / 1e9,
-        comerciais[colunas_fds].sum(axis=1) / 1e9,
-        residenciais[colunas_uteis].sum(axis=1) / 1e9,
-        residenciais[colunas_fds].sum(axis=1) / 1e9,
-    ]
-    labels = ["Comercial\núteis", "Comercial\nfds", "Residencial\núteis", "Residencial\nfds"]
-    cores = [CORES["comercial"], CORES["comercial"], CORES["residencial"], CORES["residencial"]]
+    # Volume médio por roteador (em GB)
+    com_uteis = comerciais[colunas_uteis].sum(axis=1).mean() / 1e9
+    com_fds = comerciais[colunas_fds].sum(axis=1).mean() / 1e9
+    res_uteis = residenciais[colunas_uteis].sum(axis=1).mean() / 1e9
+    res_fds = residenciais[colunas_fds].sum(axis=1).mean() / 1e9
+
+    categorias = ["Comercial\núteis", "Comercial\nfds", "Residencial\núteis", "Residencial\nfds"]
+    valores = [com_uteis, com_fds, res_uteis, res_fds]
+    cores = [CORES["comercial"], CORES["comercial"],
+             CORES["residencial"], CORES["residencial"]]
+    # úteis sólido, fds mais claro
+    alphas = [1.0, 0.5, 1.0, 0.5]
 
     fig, ax = plt.subplots(figsize=(10, 6))
-    bp = ax.boxplot(dados, tick_labels=labels, patch_artist=True, showfliers=False)
+    bars = ax.bar(categorias, valores, color=cores, edgecolor="black", width=0.6)
 
-    # Colorir as caixas
-    for patch, cor in zip(bp["boxes"], cores):
-        patch.set_facecolor(cor)
-        patch.set_alpha(0.7)
+    # Aplicar alpha diferente para fds
+    for bar, a in zip(bars, alphas):
+        bar.set_alpha(a)
 
-    ax.set_ylabel("Volume total (GB)", fontsize=12)
-    ax.set_title("Distribuição de Volume Total\nComercial vs Residencial, Úteis vs Fds",
+    # Adicionar valores nas barras
+    for bar, val in zip(bars, valores):
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.5,
+                f"{val:.1f} GB", ha="center", va="bottom", fontweight="bold", fontsize=12)
+
+    # Ajustar limite do eixo Y para não sobrar espaço em branco
+    y_max = max(valores) * 1.15
+    ax.set_ylim(0, y_max)
+
+    # Anotação explicativa (posicionada no canto, sem empurrar o eixo)
+    ax.text(0.98, 0.95,
+            "Sólido = dias úteis\nClaro = fins de semana",
+            transform=ax.transAxes, fontsize=9, ha="right", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8))
+
+    ax.set_ylabel("Volume médio por roteador (GB)", fontsize=12)
+    ax.set_title("Volume Médio: Comercial vs Residencial\nDias Úteis vs Fins de Semana",
                  fontsize=14, fontweight="bold")
     ax.grid(True, alpha=0.3, axis="y")
     salvar_grafico(fig, "06_volume_boxplot")
@@ -372,6 +390,89 @@ def grafico_scatter_razao():
 
 
 # ============================================================
+# GRÁFICO 11: Validação por endereço — concordância vs discordância
+# ============================================================
+def grafico_validacao_endereco():
+    """Compara cada método (K-Means, Regra) com o endereço (ground truth).
+
+    Mostra, para cada método:
+    - Quantos classificaram IGUAL ao endereço (concordam)
+    - Quantos classificaram DIFERENTE do endereço (discordam)
+
+    Só considera roteadores onde o endereço é definido (residencial ou comercial).
+    """
+    print("\n→ Gráfico 11: Validação por endereço (concordância vs discordância)")
+
+    # Carregar classificação por endereço
+    caminho = "data/processed/classificacao_endereco_ia.csv"
+    if not os.path.exists(caminho):
+        print("  Arquivo classificacao_endereco_ia.csv não encontrado — pulando")
+        print("  Rode classificacao_endereco_ia.py primeiro")
+        return
+
+    df_end = pd.read_csv(caminho, index_col="router_mac")
+
+    # Filtrar só roteadores com endereço definido (residencial ou comercial)
+    df_comp = df_end[df_end["classificacao_endereco"].isin(["residencial", "comercial"])].copy()
+
+    if len(df_comp) == 0:
+        print("  Nenhum roteador comparável — pulando")
+        return
+
+    total = len(df_comp)
+
+    # Concordância vs discordância de cada método com o endereço
+    km_concorda = (df_comp["classificacao_kmeans"] == df_comp["classificacao_endereco"]).sum()
+    km_discorda = total - km_concorda
+
+    regra_concorda = (df_comp["classificacao_regra"] == df_comp["classificacao_endereco"]).sum()
+    regra_discorda = total - regra_concorda
+
+    # ===== Gráfico de barras agrupadas =====
+    metodos = ["K-Means\nvs Endereço", "Regra\nvs Endereço"]
+    concordam = [km_concorda, regra_concorda]
+    discordam = [km_discorda, regra_discorda]
+
+    x = np.arange(len(metodos))
+    largura = 0.35
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    bars1 = ax.bar(x - largura/2, concordam, largura, label="Concordam (igual ao endereço)",
+                   color="#2ecc71", edgecolor="black")
+    bars2 = ax.bar(x + largura/2, discordam, largura, label="Discordam (diferente do endereço)",
+                   color="#e74c3c", edgecolor="black")
+
+    # Adicionar valores e percentuais nas barras
+    for bar, val in zip(bars1, concordam):
+        pct = val / total * 100
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 10,
+                f"{val}\n({pct:.1f}%)", ha="center", va="bottom",
+                fontweight="bold", fontsize=11)
+    for bar, val in zip(bars2, discordam):
+        pct = val / total * 100
+        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 10,
+                f"{val}\n({pct:.1f}%)", ha="center", va="bottom",
+                fontweight="bold", fontsize=11)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(metodos, fontsize=12)
+    ax.set_ylabel("Quantidade de roteadores", fontsize=12)
+    ax.set_title(f"Concordância vs Discordância com o Endereço (ground truth)\n"
+                 f"({total} roteadores comparáveis)",
+                 fontsize=14, fontweight="bold")
+    ax.legend(fontsize=11, loc="upper right")
+    ax.grid(True, alpha=0.3, axis="y")
+
+    # Ajustar limite do eixo Y
+    y_max = max(concordam) * 1.15
+    ax.set_ylim(0, y_max)
+
+    fig.tight_layout()
+    salvar_grafico(fig, "11_validacao_endereco")
+
+
+# ============================================================
 # FUNÇÃO PRINCIPAL
 # ============================================================
 def main():
@@ -397,6 +498,7 @@ def main():
     grafico_por_cidade()
     grafico_histograma_razao()
     grafico_scatter_razao()
+    grafico_validacao_endereco()
 
     print(f"\n{'='*60}")
     print("  GRÁFICOS CONCLUÍDOS!")
